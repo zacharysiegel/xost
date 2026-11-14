@@ -1,9 +1,10 @@
-# Copy to ~/.config/xost/config and chmod 600 (it holds the secr key).
+# Reference for ~/.config/xost/config, which `xost register <account>` creates.
+# Keep it chmod 600 (it holds the secr key).
 # Comments must be on their own line; a '#' after a value is treated as part of the value.
 
 [secrets]
   store = ~/.config/xost/secrets.yaml
-  key = base64-key-from-`secr key`
+  key = base64-secr-key
 
 # The quoted section name ("default" here) is a local label you choose and pass
 # to --account. It is not the @handle; the handle is the field below. Use only
@@ -29,6 +30,8 @@
   # thread_overflow_label = Full text
   # Text before ": <source url>" in a source post ending each record that does not overflow:
   # thread_source_label = Source
+  # Cron expression for `xost --account <name> schedule` (minute hour day-of-month month day-of-week):
+  # schedule = 0 9 * * *
   # chrome is optional; omit to let chromiumoxide locate a browser.
   # chrome = /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 
