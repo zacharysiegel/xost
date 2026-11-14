@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  One job per account. Replace ACCOUNT_NAME and the REPLACE_WITH_* paths, and
+  name the installed file to match the Label, e.g. ro.zach.xost.gimmick1.plist.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ro.zach.xost.ACCOUNT_NAME</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_WITH_ABSOLUTE_PATH/xost</string>
+        <string>--config</string>
+        <string>REPLACE_WITH_HOME/.config/xost/config</string>
+        <string>--account</string>
+        <string>ACCOUNT_NAME</string>
+        <string>post</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>REPLACE_WITH_HOME/Library/Logs/xost-ACCOUNT_NAME.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>REPLACE_WITH_HOME/Library/Logs/xost-ACCOUNT_NAME.log</string>
+</dict>
+</plist>

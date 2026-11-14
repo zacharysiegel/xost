@@ -1,0 +1,41 @@
+# Copy to ~/.config/xost/config and chmod 600 (it holds the secr key).
+# Comments must be on their own line; a '#' after a value is treated as part of the value.
+
+[secrets]
+  store = ~/.config/xost/secrets.yaml
+  key = base64-key-from-`secr key`
+
+# The quoted section name ("default" here) is a local label you choose and pass
+# to --account. It is not the @handle; the handle is the field below. Use only
+# letters, digits, '-', or '_' (it becomes a path, a secret name, and a launchd
+# label).
+[account "default"]
+  handle = your_handle
+  # username is optional; it defaults to handle. Set it when the login
+  # identifier differs from the handle (an email or phone number).
+  username = your_login_identifier
+  db = ~/.local/share/xost/default/queue.db
+  profile = ~/.local/share/xost/default/chrome-profile
+  # Joins a record's heading to its body when posting. Optional; defaults to
+  # one space. Quote the value to keep whitespace; escapes: \n \t \" \\
+  # heading_separator = "\n\n"
+  # Threading, all optional. Maximum weight of one post (X counts most CJK and emoji as 2):
+  # thread_post_limit = 280
+  # Maximum text posts per thread before the overflow post:
+  # thread_max_posts = 9
+  # all_posts appends " k/n" to every post; first_post only to the first:
+  # thread_numbering = all_posts
+  # Text before ": <source url>" in the overflow post; required for records that overflow:
+  # thread_overflow_label = Full text
+  # Text before ": <source url>" in a source post ending each record that does not overflow:
+  # thread_source_label = Source
+  # chrome is optional; omit to let chromiumoxide locate a browser.
+  # chrome = /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+
+# Add more accounts as their own sections. Each is fully isolated: its own
+# queue db, Chrome profile, and secrets (named <account>_password and
+# <account>_totp_seed in the shared store above).
+# [account "gimmick2"]
+#   handle = other_handle
+#   db = ~/.local/share/xost/gimmick2/queue.db
+#   profile = ~/.local/share/xost/gimmick2/chrome-profile
