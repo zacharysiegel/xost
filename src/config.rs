@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::cron::CronSchedule;
 use crate::error::AppError;
+use crate::secrets;
 use crate::thread;
 use crate::thread::ThreadNumbering;
 use crate::thread::ThreadSettings;
@@ -9,6 +11,23 @@ use crate::thread::ThreadSettings;
 const DEFAULT_HEADING_SEPARATOR: &str = " ";
 const DEFAULT_THREAD_POST_LIMIT: usize = 280;
 const DEFAULT_THREAD_MAX_POSTS: usize = 9;
+
+pub const SECRETS_SECTION: &str = "secrets";
+pub const ACCOUNT_SECTION: &str = "account";
+pub const SECRETS_STORE_KEY: &str = "store";
+pub const SECRETS_KEY_KEY: &str = "key";
+pub const HANDLE_KEY: &str = "handle";
+pub const USERNAME_KEY: &str = "username";
+pub const DB_KEY: &str = "db";
+pub const PROFILE_KEY: &str = "profile";
+pub const CHROME_KEY: &str = "chrome";
+pub const SCHEDULE_KEY: &str = "schedule";
+pub const HEADING_SEPARATOR_KEY: &str = "heading_separator";
+pub const THREAD_POST_LIMIT_KEY: &str = "thread_post_limit";
+pub const THREAD_MAX_POSTS_KEY: &str = "thread_max_posts";
+pub const THREAD_NUMBERING_KEY: &str = "thread_numbering";
+pub const THREAD_OVERFLOW_LABEL_KEY: &str = "thread_overflow_label";
+pub const THREAD_SOURCE_LABEL_KEY: &str = "thread_source_label";
 
 pub struct Config {
     pub account: String,
@@ -23,6 +42,7 @@ pub struct Config {
     pub totp_seed_secret: String,
     pub heading_separator: String,
     pub thread_settings: ThreadSettings,
+    pub schedule: Option<CronSchedule>,
 }
 
 impl Config {
@@ -35,24 +55,36 @@ impl Config {
 
         let sections: Vec<Section> = parse(&contents)?;
 
-        let account_values: &BTreeMap<String, String> = find_section(&sections, "account", Some(account))
-            .ok_or_else(|| AppError::new(&format!("no [account \"{}\"] section in config; defined accounts: {}", account, account_names(&sections))))?;
+        let account_values: &BTreeMap<String, String> = find_section(&sections, ACCOUNT_SECTION, Some(account)).ok_or_else(|| {
+            AppError::new(&format!(
+                "no {} section in config; defined accounts: {}",
+                account_section_header(account),
+                account_names(&sections),
+            ))
+        })?;
 
-        let secrets_values: &BTreeMap<String, String> = find_section(&sections, "secrets", None)
-            .ok_or_else(|| AppError::new("config has no [secrets] section (expected keys: store, key)"))?;
+        let secrets_values: &BTreeMap<String, String> = find_section(&sections, SECRETS_SECTION, None).ok_or_else(|| {
+            AppError::new(&format!(
+                "config has no {} section (expected keys: {}, {})",
+                secrets_section_header(),
+                SECRETS_STORE_KEY,
+                SECRETS_KEY_KEY,
+            ))
+        })?;
 
-        let handle: String = require(account_values, "handle", account)?;
-        let username: String = account_values.get("username").cloned().unwrap_or_else(|| handle.clone());
-        let db_path: PathBuf = expand_user_path(&require(account_values, "db", account)?);
-        let profile_dir: PathBuf = expand_user_path(&require(account_values, "profile", account)?);
-        let chrome_path: Option<PathBuf> = account_values.get("chrome").map(|raw| expand_user_path(raw));
-        let secr_store_path: PathBuf = expand_user_path(&require(secrets_values, "store", "secrets")?);
-        let secr_key_base64: String = require(secrets_values, "key", "secrets")?;
-        let heading_separator: String = match account_values.get("heading_separator") {
+        let handle: String = require(account_values, HANDLE_KEY, account)?;
+        let username: String = account_values.get(USERNAME_KEY).cloned().unwrap_or_else(|| handle.clone());
+        let db_path: PathBuf = expand_user_path(&require(account_values, DB_KEY, account)?);
+        let profile_dir: PathBuf = expand_user_path(&require(account_values, PROFILE_KEY, account)?);
+        let chrome_path: Option<PathBuf> = account_values.get(CHROME_KEY).map(|raw| expand_user_path(raw));
+        let secr_store_path: PathBuf = expand_user_path(&require(secrets_values, SECRETS_STORE_KEY, SECRETS_SECTION)?);
+        let secr_key_base64: String = require(secrets_values, SECRETS_KEY_KEY, SECRETS_SECTION)?;
+        let heading_separator: String = match account_values.get(HEADING_SEPARATOR_KEY) {
             Some(raw) => parse_string_value(raw)?,
             None => DEFAULT_HEADING_SEPARATOR.to_string(),
         };
         let thread_settings: ThreadSettings = parse_thread_settings(account_values)?;
+        let schedule: Option<CronSchedule> = parse_schedule(account_values)?;
 
         Ok(Config {
             account: account.to_string(),
@@ -63,31 +95,42 @@ impl Config {
             handle,
             secr_store_path,
             secr_key_base64,
-            password_secret: format!("{}_password", account),
-            totp_seed_secret: format!("{}_totp_seed", account),
+            password_secret: secrets::password_secret_name(account),
+            totp_seed_secret: secrets::totp_seed_secret_name(account),
             heading_separator,
             thread_settings,
+            schedule,
         })
     }
 }
 
-fn parse_thread_settings(account_values: &BTreeMap<String, String>) -> Result<ThreadSettings, AppError> {
-    let post_limit: usize = parse_count_value(account_values, "thread_post_limit", DEFAULT_THREAD_POST_LIMIT)?;
-    let max_posts: usize = parse_count_value(account_values, "thread_max_posts", DEFAULT_THREAD_MAX_POSTS)?;
+fn parse_schedule(account_values: &BTreeMap<String, String>) -> Result<Option<CronSchedule>, AppError> {
+    let Some(raw) = account_values.get(SCHEDULE_KEY) else {
+        return Ok(None);
+    };
 
-    let numbering: ThreadNumbering = match account_values.get("thread_numbering").map(String::as_str) {
+    let schedule: CronSchedule = CronSchedule::parse(raw)?;
+
+    Ok(Some(schedule))
+}
+
+fn parse_thread_settings(account_values: &BTreeMap<String, String>) -> Result<ThreadSettings, AppError> {
+    let post_limit: usize = parse_count_value(account_values, THREAD_POST_LIMIT_KEY, DEFAULT_THREAD_POST_LIMIT)?;
+    let max_posts: usize = parse_count_value(account_values, THREAD_MAX_POSTS_KEY, DEFAULT_THREAD_MAX_POSTS)?;
+
+    let numbering: ThreadNumbering = match account_values.get(THREAD_NUMBERING_KEY).map(String::as_str) {
         None | Some("all_posts") => ThreadNumbering::AllPosts,
         Some("first_post") => ThreadNumbering::FirstPost,
         Some(other) => {
             return Err(AppError::new(&format!(
-                "thread_numbering must be all_posts or first_post, not '{}'",
-                other,
+                "{} must be all_posts or first_post, not '{}'",
+                THREAD_NUMBERING_KEY, other,
             )));
         }
     };
 
-    let overflow_label: Option<String> = parse_optional_string_value(account_values, "thread_overflow_label")?;
-    let source_label: Option<String> = parse_optional_string_value(account_values, "thread_source_label")?;
+    let overflow_label: Option<String> = parse_optional_string_value(account_values, THREAD_OVERFLOW_LABEL_KEY)?;
+    let source_label: Option<String> = parse_optional_string_value(account_values, THREAD_SOURCE_LABEL_KEY)?;
 
     let thread_settings: ThreadSettings = ThreadSettings {
         post_limit,
@@ -104,11 +147,11 @@ fn parse_thread_settings(account_values: &BTreeMap<String, String>) -> Result<Th
 
 fn validate_thread_settings(thread_settings: &ThreadSettings) -> Result<(), AppError> {
     if thread_settings.max_posts == 0 {
-        return Err(AppError::new("thread_max_posts must be at least 1"));
+        return Err(AppError::new(&format!("{} must be at least 1", THREAD_MAX_POSTS_KEY)));
     }
 
-    validate_link_label("thread_overflow_label", thread_settings.overflow_label.as_deref(), thread_settings.post_limit)?;
-    validate_link_label("thread_source_label", thread_settings.source_label.as_deref(), thread_settings.post_limit)?;
+    validate_link_label(THREAD_OVERFLOW_LABEL_KEY, thread_settings.overflow_label.as_deref(), thread_settings.post_limit)?;
+    validate_link_label(THREAD_SOURCE_LABEL_KEY, thread_settings.source_label.as_deref(), thread_settings.post_limit)?;
 
     Ok(())
 }
@@ -122,8 +165,8 @@ fn validate_link_label(key: &str, label: Option<&str>, post_limit: usize) -> Res
 
     if link_post_weight > post_limit {
         return Err(AppError::new(&format!(
-            "{} makes its link post weigh {}, more than thread_post_limit {}",
-            key, link_post_weight, post_limit,
+            "{} makes its link post weigh {}, more than {} {}",
+            key, link_post_weight, THREAD_POST_LIMIT_KEY, post_limit,
         )));
     }
 
@@ -184,13 +227,21 @@ pub fn default_config_path() -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(home).join(".config").join("xost").join("config"))
 }
 
-struct Section {
+pub fn secrets_section_header() -> String {
+    format!("[{}]", SECRETS_SECTION)
+}
+
+pub fn account_section_header(account: &str) -> String {
+    format!("[{} \"{}\"]", ACCOUNT_SECTION, account)
+}
+
+pub struct Section {
     kind: String,
     name: Option<String>,
     values: BTreeMap<String, String>,
 }
 
-fn parse(contents: &str) -> Result<Vec<Section>, AppError> {
+pub fn parse(contents: &str) -> Result<Vec<Section>, AppError> {
     let mut sections: Vec<Section> = Vec::new();
 
     for raw_line in contents.lines() {
@@ -242,7 +293,7 @@ fn parse_header(inner: &str) -> Result<Section, AppError> {
     }
 }
 
-fn find_section<'a>(sections: &'a [Section], kind: &str, name: Option<&str>) -> Option<&'a BTreeMap<String, String>> {
+pub fn find_section<'a>(sections: &'a [Section], kind: &str, name: Option<&str>) -> Option<&'a BTreeMap<String, String>> {
     sections
         .iter()
         .find(|section| section.kind == kind && section.name.as_deref() == name)
@@ -252,7 +303,7 @@ fn find_section<'a>(sections: &'a [Section], kind: &str, name: Option<&str>) -> 
 fn account_names(sections: &[Section]) -> String {
     let names: Vec<&str> = sections
         .iter()
-        .filter(|section| section.kind == "account")
+        .filter(|section| section.kind == ACCOUNT_SECTION)
         .filter_map(|section| section.name.as_deref())
         .collect();
 
@@ -263,7 +314,7 @@ fn account_names(sections: &[Section]) -> String {
     names.join(", ")
 }
 
-fn require(values: &BTreeMap<String, String>, key: &str, context: &str) -> Result<String, AppError> {
+pub fn require(values: &BTreeMap<String, String>, key: &str, context: &str) -> Result<String, AppError> {
     values
         .get(key)
         .filter(|value| !value.is_empty())
@@ -271,7 +322,7 @@ fn require(values: &BTreeMap<String, String>, key: &str, context: &str) -> Resul
         .ok_or_else(|| AppError::new(&format!("config section '{}' is missing required key '{}'", context, key)))
 }
 
-fn validate_account_name(account: &str) -> Result<(), AppError> {
+pub fn validate_account_name(account: &str) -> Result<(), AppError> {
     let valid: bool = !account.is_empty()
         && account.chars().all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_');
 
@@ -286,7 +337,7 @@ fn validate_account_name(account: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn expand_user_path(raw: &str) -> PathBuf {
+pub fn expand_user_path(raw: &str) -> PathBuf {
     let Some(remainder) = raw.strip_prefix("~/") else {
         return PathBuf::from(raw);
     };
@@ -416,6 +467,29 @@ mod tests {
     #[test]
     fn load_rejects_a_source_label_whose_post_exceeds_thread_post_limit() {
         let contents: String = format!("{}  thread_post_limit = 30\n  thread_source_label = Source\n", SAMPLE);
+
+        assert!(config_from(&contents, "gimmick2").is_err());
+    }
+
+    #[test]
+    fn load_leaves_the_schedule_unset_when_absent() {
+        let config: Config = config_from(SAMPLE, "gimmick1").unwrap();
+
+        assert_eq!(config.schedule, None);
+    }
+
+    #[test]
+    fn load_parses_the_schedule() {
+        let contents: String = format!("{}  schedule = 0 9 * * *\n", SAMPLE);
+
+        let config: Config = config_from(&contents, "gimmick2").unwrap();
+
+        assert_eq!(config.schedule, Some(CronSchedule::parse("0 9 * * *").unwrap()));
+    }
+
+    #[test]
+    fn load_rejects_an_invalid_schedule() {
+        let contents: String = format!("{}  schedule = 0 9 * * MON\n", SAMPLE);
 
         assert!(config_from(&contents, "gimmick2").is_err());
     }

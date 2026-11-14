@@ -1,12 +1,16 @@
 mod browser;
 mod clock;
 mod config;
+mod cron;
 mod error;
 mod notify;
 mod queue;
+mod register;
+mod schedule;
 mod secrets;
 mod thread;
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -17,6 +21,7 @@ use crate::browser::Session;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::queue::QueuedTweet;
+use crate::schedule::ScheduleAction;
 
 const MAX_POST_ATTEMPTS: u32 = 3;
 
@@ -35,6 +40,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Register {
+        #[arg(value_name = "ACCOUNT")]
+        account_name: String,
+    },
+    #[command(flatten)]
+    Account(AccountCommand),
+}
+
+#[derive(Subcommand)]
+enum AccountCommand {
     Post,
     Login,
     AutoLogin,
@@ -57,6 +72,13 @@ enum Command {
         #[arg(long)]
         order: Option<i64>,
     },
+    Schedule {
+        #[arg(long, conflicts_with = "print")]
+        remove: bool,
+
+        #[arg(long)]
+        print: bool,
+    },
 }
 
 #[tokio::main]
@@ -73,26 +95,59 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), AppError> {
     let cli: Cli = Cli::parse();
 
-    let config_path: PathBuf = match cli.config {
-        Some(path) => path,
+    let config_path: PathBuf = match &cli.config {
+        Some(path) => path.clone(),
         None => config::default_config_path()?,
     };
 
-    let config: Config = Config::load(&config_path, &cli.account)?;
-
     match cli.command {
-        Command::Post => run_post(&config).await,
-        Command::Login => run_login(&config).await,
-        Command::AutoLogin => run_auto_login(&config).await,
-        Command::Diagnose => run_diagnose(&config).await,
-        Command::ExportSession => run_export_session(&config).await,
-        Command::ImportSession { from } => run_import_session(&config, &from).await,
-        Command::Enqueue {
+        Command::Register { account_name } => register::run(&config_path, cli.config.as_deref(), &account_name),
+        Command::Account(account_command) => run_account_command(account_command, &config_path, &cli.account).await,
+    }
+}
+
+async fn run_account_command(account_command: AccountCommand, config_path: &Path, account: &str) -> Result<(), AppError> {
+    match account_command {
+        AccountCommand::Schedule { remove: true, .. } => remove_schedule(account),
+        configured_account_command => run_configured_account_command(configured_account_command, config_path, account).await,
+    }
+}
+
+fn remove_schedule(account: &str) -> Result<(), AppError> {
+    config::validate_account_name(account)?;
+
+    schedule::remove(account)
+}
+
+async fn run_configured_account_command(
+    account_command: AccountCommand,
+    config_path: &Path,
+    account: &str,
+) -> Result<(), AppError> {
+    let config: Config = Config::load(config_path, account)?;
+
+    match account_command {
+        AccountCommand::Post => run_post(&config).await,
+        AccountCommand::Login => run_login(&config).await,
+        AccountCommand::AutoLogin => run_auto_login(&config).await,
+        AccountCommand::Diagnose => run_diagnose(&config).await,
+        AccountCommand::ExportSession => run_export_session(&config).await,
+        AccountCommand::ImportSession { from } => run_import_session(&config, &from).await,
+        AccountCommand::Enqueue {
             heading,
             body,
             source_url,
             order,
         } => run_enqueue(&config, heading.as_deref(), &body, source_url.as_deref(), order),
+        // Removal is dispatched before the config loads, in run_account_command.
+        AccountCommand::Schedule { remove: _, print } => schedule::run(&config, config_path, schedule_action(print)),
+    }
+}
+
+fn schedule_action(print: bool) -> ScheduleAction {
+    match print {
+        true => ScheduleAction::Print,
+        false => ScheduleAction::Install,
     }
 }
 

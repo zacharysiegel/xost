@@ -1,3 +1,4 @@
+use crate::config;
 use crate::error::AppError;
 
 // X shortens every URL to a t.co link of this weight.
@@ -192,8 +193,9 @@ fn compose_overflow_post(source_url: Option<&str>, settings: &ThreadSettings) ->
 
     let Some(overflow_label) = settings.overflow_label.as_deref() else {
         return Err(AppError::new(&format!(
-            "text needs more than {} thread posts but the account has no thread_overflow_label",
+            "text needs more than {} thread posts but the account has no {}",
             settings.max_posts,
+            config::THREAD_OVERFLOW_LABEL_KEY,
         )));
     };
 
