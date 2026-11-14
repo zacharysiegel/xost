@@ -1,0 +1,17 @@
+[package]
+name = "xost"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22.*"
+chromiumoxide = "0.9.*"
+clap = { version = "4.6.*", features = ["derive"] }
+futures = "0.3.*"
+minimer = "2.2.*"
+rusqlite = { version = "0.42.*", features = ["bundled"] }
+secr = "1.2.*"
+serde_json = "1.0.*"
+time = { version = "0.3.*", features = ["macros", "formatting", "parsing"] }
+tokio = { version = "1.54.*", features = ["macros", "rt-multi-thread", "time"] }
+totp-rs = "6.0.*"
