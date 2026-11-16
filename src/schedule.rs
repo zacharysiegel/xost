@@ -14,6 +14,7 @@ use crate::cron::DayRestriction;
 use crate::error::AppError;
 
 const LABEL_PREFIX: &str = "ro.zach.xost.";
+const CHECK_LABEL_SUFFIX: &str = ".check";
 const LAUNCH_DAEMONS_DIRECTORY: &str = "/Library/LaunchDaemons";
 const SUDO_PATH: &str = "/usr/bin/sudo";
 const LAUNCHCTL_PATH: &str = "/bin/launchctl";
@@ -43,6 +44,45 @@ const PLIST_FOOTER: &str = "\
 pub enum ScheduleAction {
     Install,
     Print,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum JobKind {
+    Post,
+    Check,
+}
+
+impl JobKind {
+    pub const ALL: [JobKind; 2] = [JobKind::Post, JobKind::Check];
+
+    pub fn schedule_key(self) -> &'static str {
+        match self {
+            JobKind::Post => config::SCHEDULE_KEY,
+            JobKind::Check => config::CHECK_SCHEDULE_KEY,
+        }
+    }
+
+    fn subcommand(self) -> &'static str {
+        match self {
+            JobKind::Post => "post",
+            JobKind::Check => "check",
+        }
+    }
+
+    // Account names cannot contain '.', so these suffixes never collide with another account's names.
+    fn name_suffix(self) -> &'static str {
+        match self {
+            JobKind::Post => "",
+            JobKind::Check => CHECK_LABEL_SUFFIX,
+        }
+    }
+
+    fn get_schedule(self, config: &Config) -> Option<&CronSchedule> {
+        match self {
+            JobKind::Post => config.schedule.as_ref(),
+            JobKind::Check => config.check_schedule.as_ref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -83,6 +123,7 @@ impl CalendarInterval {
 
 pub struct LaunchDaemonJob {
     pub account: String,
+    pub job_kind: JobKind,
     pub user_name: String,
     pub home_directory: String,
     pub executable_path: String,
@@ -109,28 +150,86 @@ enum BootstrapDecision {
     Fail,
 }
 
+#[derive(Debug, PartialEq)]
+enum JobPresence {
+    Present,
+    Absent,
+}
+
+struct JobEnvironment {
+    user_name: String,
+    home_directory: String,
+    executable_path: String,
+    config_path: String,
+}
+
 pub fn run(config: &Config, config_path: &Path, action: ScheduleAction) -> Result<(), AppError> {
+    let launch_daemon_jobs: Vec<LaunchDaemonJob> = create_launch_daemon_jobs(config, config_path)?;
+
     match action {
-        ScheduleAction::Print => print_plist(config, config_path),
-        ScheduleAction::Install => install(config, config_path),
+        ScheduleAction::Print => print_plists(&launch_daemon_jobs),
+        ScheduleAction::Install => install(&launch_daemon_jobs, &config.account),
     }
 }
 
-fn print_plist(config: &Config, config_path: &Path) -> Result<(), AppError> {
-    let job: LaunchDaemonJob = create_launch_daemon_job(config, config_path)?;
+fn create_launch_daemon_jobs(config: &Config, config_path: &Path) -> Result<Vec<LaunchDaemonJob>, AppError> {
+    if config.schedule.is_none() {
+        return Err(AppError::new(&format!(
+            "account '{}' has no {} key; add one to its config section, e.g. {} = 0 9 * * *",
+            config.account,
+            config::SCHEDULE_KEY,
+            config::SCHEDULE_KEY,
+        )));
+    }
 
-    print!("{}", render_plist(&job));
+    let job_environment: JobEnvironment = get_job_environment(config_path)?;
+    let mut launch_daemon_jobs: Vec<LaunchDaemonJob> = Vec::new();
+
+    for job_kind in JobKind::ALL {
+        let Some(schedule) = job_kind.get_schedule(config)
+        else {
+            continue;
+        };
+
+        launch_daemon_jobs.push(create_launch_daemon_job(&config.account, job_kind, schedule, &job_environment));
+    }
+
+    Ok(launch_daemon_jobs)
+}
+
+fn print_plists(launch_daemon_jobs: &[LaunchDaemonJob]) -> Result<(), AppError> {
+    for launch_daemon_job in launch_daemon_jobs {
+        eprintln!("Label: {}", job_label(&launch_daemon_job.account, launch_daemon_job.job_kind));
+        print!("{}", render_plist(launch_daemon_job));
+    }
 
     Ok(())
 }
 
-fn install(config: &Config, config_path: &Path) -> Result<(), AppError> {
-    let job: LaunchDaemonJob = create_launch_daemon_job(config, config_path)?;
-    let label: String = job_label(&config.account);
+fn install(launch_daemon_jobs: &[LaunchDaemonJob], account: &str) -> Result<(), AppError> {
+    for launch_daemon_job in launch_daemon_jobs {
+        install_job(launch_daemon_job)?;
+    }
+
+    for job_kind in JobKind::ALL {
+        let job_requested: bool = launch_daemon_jobs.iter().any(|launch_daemon_job| launch_daemon_job.job_kind == job_kind);
+        let job_present: JobPresence = read_job_presence(account, job_kind);
+
+        if !job_requested && job_present == JobPresence::Present {
+            remove_job_and_report(account, job_kind)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn install_job(job: &LaunchDaemonJob) -> Result<(), AppError> {
+    let label: String = job_label(&job.account, job.job_kind);
     let installed_plist_path: String = installed_plist_path(&label);
 
     let temporary_plist_path: PathBuf = std::env::temp_dir().join(format!("{}.{}.plist", label, std::process::id()));
-    std::fs::write(&temporary_plist_path, render_plist(&job))?;
+
+    std::fs::write(&temporary_plist_path, render_plist(job))?;
 
     let copy_result: Result<(), AppError> = copy_plist_into_launch_daemons(&temporary_plist_path, &installed_plist_path);
     std::fs::remove_file(&temporary_plist_path).ok();
@@ -142,17 +241,38 @@ fn install(config: &Config, config_path: &Path) -> Result<(), AppError> {
     println!("installed the LaunchDaemon");
     println!("Label: {}", label);
     println!("Plist: {}", installed_plist_path);
-    println!("Log: {}", log_path(&job.home_directory, &job.account));
+    println!("Log: {}", log_path(&job.home_directory, &job.account, job.job_kind));
 
     Ok(())
 }
 
 pub fn remove(account: &str) -> Result<(), AppError> {
-    let label: String = job_label(account);
+    let mut removed_job_count: usize = 0;
+
+    for job_kind in JobKind::ALL {
+        let job_presence: JobPresence = read_job_presence(account, job_kind);
+
+        if job_presence == JobPresence::Absent {
+            continue;
+        }
+
+        remove_job_and_report(account, job_kind)?;
+        removed_job_count += 1;
+    }
+
+    if removed_job_count == 0 {
+        println!("no installed or loaded LaunchDaemon; nothing to remove");
+        println!("Account: {}", account);
+    }
+
+    Ok(())
+}
+
+fn remove_job_and_report(account: &str, job_kind: JobKind) -> Result<(), AppError> {
+    let label: String = job_label(account, job_kind);
     let installed_plist_path: String = installed_plist_path(&label);
 
-    bootout(&label)?;
-    delete_installed_plist(&installed_plist_path)?;
+    remove_job(&label, &installed_plist_path)?;
 
     println!("removed the LaunchDaemon");
     println!("Label: {}", label);
@@ -161,16 +281,29 @@ pub fn remove(account: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn create_launch_daemon_job(config: &Config, config_path: &Path) -> Result<LaunchDaemonJob, AppError> {
-    let schedule: &CronSchedule = config.schedule.as_ref().ok_or_else(|| {
-        AppError::new(&format!(
-            "account '{}' has no {} key; add one to its config section, e.g. {} = 0 9 * * *",
-            config.account,
-            config::SCHEDULE_KEY,
-            config::SCHEDULE_KEY,
-        ))
-    })?;
+pub fn remove_job(label: &str, installed_plist_path: &str) -> Result<(), AppError> {
+    bootout(label)?;
 
+    delete_installed_plist(installed_plist_path)
+}
+
+fn read_job_presence(account: &str, job_kind: JobKind) -> JobPresence {
+    let label: String = job_label(account, job_kind);
+    let plist_present: bool = Path::new(&installed_plist_path(&label)).exists();
+
+    if plist_present {
+        return JobPresence::Present;
+    }
+
+    let job_loading: JobLoading = read_job_loading(&label);
+
+    match job_loading {
+        JobLoading::NotLoaded => JobPresence::Absent,
+        JobLoading::Loaded | JobLoading::Unknown => JobPresence::Present,
+    }
+}
+
+fn get_job_environment(config_path: &Path) -> Result<JobEnvironment, AppError> {
     let user_name: String = invoking_user_name()?;
 
     if user_name == ROOT_USER_NAME {
@@ -184,14 +317,29 @@ fn create_launch_daemon_job(config: &Config, config_path: &Path) -> Result<Launc
     let executable_path: PathBuf = std::env::current_exe()?.canonicalize()?;
     let absolute_config_path: PathBuf = config_path.canonicalize()?;
 
-    Ok(LaunchDaemonJob {
-        account: config.account.clone(),
+    Ok(JobEnvironment {
         user_name,
         home_directory,
         executable_path: path_to_string(&executable_path)?,
         config_path: path_to_string(&absolute_config_path)?,
-        calendar_intervals: calendar_intervals(schedule),
     })
+}
+
+fn create_launch_daemon_job(
+    account: &str,
+    job_kind: JobKind,
+    schedule: &CronSchedule,
+    job_environment: &JobEnvironment,
+) -> LaunchDaemonJob {
+    LaunchDaemonJob {
+        account: account.to_string(),
+        job_kind,
+        user_name: job_environment.user_name.clone(),
+        home_directory: job_environment.home_directory.clone(),
+        executable_path: job_environment.executable_path.clone(),
+        config_path: job_environment.config_path.clone(),
+        calendar_intervals: calendar_intervals(schedule),
+    }
 }
 
 fn invoking_user_name() -> Result<String, AppError> {
@@ -267,9 +415,16 @@ fn expand(
 }
 
 pub fn render_plist(job: &LaunchDaemonJob) -> String {
-    let label: String = job_label(&job.account);
-    let log_path: String = log_path(&job.home_directory, &job.account);
-    let program_arguments: [&str; 6] = [&job.executable_path, "--config", &job.config_path, "--account", &job.account, "post"];
+    let label: String = job_label(&job.account, job.job_kind);
+    let log_path: String = log_path(&job.home_directory, &job.account, job.job_kind);
+    let program_arguments: [&str; 6] = [
+        &job.executable_path,
+        "--config",
+        &job.config_path,
+        "--account",
+        &job.account,
+        job.job_kind.subcommand(),
+    ];
 
     let mut plist: String = String::from(PLIST_HEADER);
 
@@ -346,19 +501,19 @@ fn escape_xml(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-pub fn job_label(account: &str) -> String {
-    format!("{}{}", LABEL_PREFIX, account)
+pub fn job_label(account: &str, job_kind: JobKind) -> String {
+    format!("{}{}{}", LABEL_PREFIX, account, job_kind.name_suffix())
 }
 
 pub fn installed_plist_path(label: &str) -> String {
     format!("{}/{}.plist", LAUNCH_DAEMONS_DIRECTORY, label)
 }
 
-fn log_path(home_directory: &str, account: &str) -> String {
+fn log_path(home_directory: &str, account: &str, job_kind: JobKind) -> String {
     Path::new(home_directory)
         .join("Library")
         .join("Logs")
-        .join(format!("xost-{}.log", account))
+        .join(format!("xost-{}{}.log", account, job_kind.name_suffix()))
         .display()
         .to_string()
 }
@@ -518,9 +673,10 @@ mod tests {
         }
     }
 
-    fn get_sample_job(account: &str) -> LaunchDaemonJob {
+    fn get_sample_job(account: &str, job_kind: JobKind) -> LaunchDaemonJob {
         LaunchDaemonJob {
             account: account.to_string(),
+            job_kind,
             user_name: "zachary".to_string(),
             home_directory: "/Users/example".to_string(),
             executable_path: "/opt/xost/bin/xost".to_string(),
@@ -622,12 +778,26 @@ mod tests {
 </plist>
 ";
 
-        assert_eq!(render_plist(&get_sample_job("daily")), expected_plist);
+        assert_eq!(render_plist(&get_sample_job("daily", JobKind::Post)), expected_plist);
+    }
+
+    #[test]
+    fn render_plist_renders_the_check_job_with_its_own_label_subcommand_and_log() {
+        let plist: String = render_plist(&get_sample_job("daily", JobKind::Check));
+
+        let expected_fragments: [&str; 3] = [
+            "    <key>Label</key>\n    <string>ro.zach.xost.daily.check</string>\n",
+            "        <string>daily</string>\n        <string>check</string>\n    </array>\n",
+            "    <key>StandardOutPath</key>\n    <string>/Users/example/Library/Logs/xost-daily.check.log</string>\n",
+        ];
+        let missing_fragments: Vec<&str> =
+            expected_fragments.into_iter().filter(|expected_fragment| !plist.contains(expected_fragment)).collect();
+        assert_eq!(missing_fragments, Vec::<&str>::new());
     }
 
     #[test]
     fn render_plist_escapes_xml_special_characters() {
-        let mut job: LaunchDaemonJob = get_sample_job("daily");
+        let mut job: LaunchDaemonJob = get_sample_job("daily", JobKind::Post);
         job.config_path = "/Users/example/<a & b> \"c\" 'd'".to_string();
 
         let plist: String = render_plist(&job);

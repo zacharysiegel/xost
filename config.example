@@ -32,6 +32,8 @@
   # thread_source_label = Source
   # Cron expression for `xost --account <name> schedule` (minute hour day-of-month month day-of-week):
   # schedule = 0 9 * * *
+  # Cron expression for the job that runs `xost --account <name> check`, installed by `schedule`:
+  # check_schedule = 30 8 * * *
   # chrome is optional; omit to let chromiumoxide locate a browser.
   # chrome = /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 

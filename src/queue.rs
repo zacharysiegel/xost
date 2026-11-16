@@ -4,6 +4,7 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::params;
 
+use crate::alert_state;
 use crate::clock;
 use crate::error::AppError;
 
@@ -88,6 +89,7 @@ pub fn init_schema(connection: &Connection) -> Result<(), AppError> {
 
     rename_overflow_url_to_source_url_if_present(connection)?;
     add_missing_columns(connection)?;
+    alert_state::create_table_if_missing(connection)?;
 
     Ok(())
 }
@@ -311,6 +313,7 @@ mod tests {
     #[test]
     fn init_schema_adds_missing_columns_to_a_table_created_without_them() {
         let connection: Connection = Connection::open_in_memory().unwrap();
+
         connection
             .execute_batch("create table tweet_queue (id integer primary key autoincrement, body text not null, queue_order integer not null);")
             .unwrap();
@@ -326,6 +329,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(added_column_count, 3);
+    }
+
+    #[test]
+    fn init_schema_adds_the_alert_state_table_to_an_existing_database() {
+        let connection: Connection = Connection::open_in_memory().unwrap();
+
+        connection
+            .execute_batch("create table tweet_queue (id integer primary key autoincrement, body text not null, queue_order integer not null);")
+            .unwrap();
+
+        init_schema(&connection).unwrap();
+
+        let alert_state_column_names: Vec<String> = connection
+            .prepare("select name from pragma_table_info('alert_state') order by cid asc")
+            .unwrap()
+            .query_map([], |record| record.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+
+        assert_eq!(alert_state_column_names, vec!["condition_key", "alerted_value", "alerted_at"]);
     }
 
     #[test]

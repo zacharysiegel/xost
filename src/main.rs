@@ -1,10 +1,14 @@
+mod alert;
+mod alert_state;
 mod browser;
+mod browser_lock;
+mod check;
+mod chrome_singleton_lock;
 mod clock;
 mod config;
 mod cron;
 mod deregister;
 mod error;
-mod notify;
 mod private_file;
 mod prompt;
 mod queue;
@@ -19,10 +23,14 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use clap::Subcommand;
+use simple_alert::alert::AlertLevel;
 
 use crate::browser::PostFailure;
 use crate::browser::Session;
+use crate::browser_lock::BrowserLock;
+use crate::browser_lock::BrowserLockAcquisition;
 use crate::config::Config;
+use crate::config::Section;
 use crate::deregister::DataHandling;
 use crate::error::AppError;
 use crate::queue::QueuedTweet;
@@ -63,6 +71,7 @@ enum Command {
         #[arg(long)]
         check_login: bool,
     },
+    Check,
     #[command(flatten)]
     Account(AccountCommand),
 }
@@ -128,11 +137,8 @@ async fn run() -> Result<(), AppError> {
         Command::Status { check_login } => {
             status::run(&config_path, cli.account.as_deref(), login_check_request(check_login)).await
         }
-        Command::Account(account_command) => {
-            let account: &str = cli.account.as_deref().unwrap_or(DEFAULT_ACCOUNT);
-
-            run_account_command(account_command, &config_path, account).await
-        }
+        Command::Check => check::run(&config_path, cli.account.as_deref()).await,
+        Command::Account(account_command) => run_account_command(account_command, &config_path, cli.account.as_deref()).await,
     }
 }
 
@@ -150,11 +156,62 @@ fn data_handling(delete_data: bool) -> DataHandling {
     }
 }
 
-async fn run_account_command(account_command: AccountCommand, config_path: &Path, account: &str) -> Result<(), AppError> {
+async fn run_account_command(
+    account_command: AccountCommand,
+    config_path: &Path,
+    requested_account: Option<&str>,
+) -> Result<(), AppError> {
+    let account: &str = requested_account.unwrap_or(DEFAULT_ACCOUNT);
+
     match account_command {
         AccountCommand::Schedule { remove: true, .. } => remove_schedule(account),
-        configured_account_command => run_configured_account_command(configured_account_command, config_path, account).await,
+        configured_account_command => {
+            let config: Config = load_config(&configured_account_command, config_path, requested_account, account)?;
+
+            run_configured_account_command(configured_account_command, &config, config_path).await
+        }
     }
+}
+
+#[derive(PartialEq)]
+enum UnusableConfigAlerting {
+    Send,
+    Skip,
+}
+
+fn get_unusable_config_alerting(account_command: &AccountCommand) -> UnusableConfigAlerting {
+    match account_command {
+        AccountCommand::Post => UnusableConfigAlerting::Send,
+        AccountCommand::Login
+        | AccountCommand::AutoLogin
+        | AccountCommand::Diagnose
+        | AccountCommand::ExportSession
+        | AccountCommand::ImportSession { .. }
+        | AccountCommand::Enqueue { .. }
+        | AccountCommand::Schedule { .. } => UnusableConfigAlerting::Skip,
+    }
+}
+
+fn load_config(
+    account_command: &AccountCommand,
+    config_path: &Path,
+    requested_account: Option<&str>,
+    account: &str,
+) -> Result<Config, AppError> {
+    let sections_result: Result<Vec<Section>, AppError> = config::read_sections(config_path);
+
+    let sections: Vec<Section> = match sections_result {
+        Ok(sections) => sections,
+        Err(error) => {
+            if get_unusable_config_alerting(account_command) == UnusableConfigAlerting::Send {
+                alert::send_unusable_config_alert(requested_account, &error);
+            }
+
+            return Err(error);
+        }
+    };
+
+    Config::from_sections(&sections, account)
 }
 
 fn remove_schedule(account: &str) -> Result<(), AppError> {
@@ -165,26 +222,24 @@ fn remove_schedule(account: &str) -> Result<(), AppError> {
 
 async fn run_configured_account_command(
     account_command: AccountCommand,
+    config: &Config,
     config_path: &Path,
-    account: &str,
 ) -> Result<(), AppError> {
-    let config: Config = Config::load(config_path, account)?;
-
     match account_command {
-        AccountCommand::Post => run_post(&config).await,
-        AccountCommand::Login => run_login(&config).await,
-        AccountCommand::AutoLogin => run_auto_login(&config).await,
-        AccountCommand::Diagnose => run_diagnose(&config).await,
-        AccountCommand::ExportSession => run_export_session(&config).await,
-        AccountCommand::ImportSession { from } => run_import_session(&config, &from).await,
+        AccountCommand::Post => run_post(config).await,
+        AccountCommand::Login => run_login(config).await,
+        AccountCommand::AutoLogin => run_auto_login(config).await,
+        AccountCommand::Diagnose => run_diagnose(config).await,
+        AccountCommand::ExportSession => run_export_session(config).await,
+        AccountCommand::ImportSession { from } => run_import_session(config, &from).await,
         AccountCommand::Enqueue {
             heading,
             body,
             source_url,
             order,
-        } => run_enqueue(&config, heading.as_deref(), &body, source_url.as_deref(), order),
+        } => run_enqueue(config, heading.as_deref(), &body, source_url.as_deref(), order),
         // Removal is dispatched before the config loads, in run_account_command.
-        AccountCommand::Schedule { remove: _, print } => schedule::run(&config, config_path, schedule_action(print)),
+        AccountCommand::Schedule { remove: _, print } => schedule::run(config, config_path, schedule_action(print)),
     }
 }
 
@@ -196,7 +251,8 @@ fn schedule_action(print: bool) -> ScheduleAction {
 }
 
 async fn run_export_session(config: &Config) -> Result<(), AppError> {
-    let session: Session = Session::launch(config).await?;
+    let browser_lock: BrowserLock = browser_lock::acquire_without_waiting(&config.db_path)?;
+    let session: Session = Session::launch(config, browser_lock).await?;
 
     let export_result: Result<String, AppError> = session.export_cookies().await;
 
@@ -211,7 +267,8 @@ async fn run_export_session(config: &Config) -> Result<(), AppError> {
 async fn run_import_session(config: &Config, from: &std::path::Path) -> Result<(), AppError> {
     let cookies_json: String = std::fs::read_to_string(from)?;
 
-    let session: Session = Session::launch(config).await?;
+    let browser_lock: BrowserLock = browser_lock::acquire_without_waiting(&config.db_path)?;
+    let session: Session = Session::launch(config, browser_lock).await?;
 
     let import_result: Result<(), AppError> = session.import_cookies(&cookies_json).await;
 
@@ -228,7 +285,8 @@ async fn run_auto_login(config: &Config) -> Result<(), AppError> {
     test_profile.push("-logintest");
     let test_profile: PathBuf = PathBuf::from(test_profile);
 
-    let session: Session = Session::launch_with_profile(config, &test_profile).await?;
+    let browser_lock: BrowserLock = browser_lock::acquire_without_waiting(&config.db_path)?;
+    let session: Session = Session::launch_with_profile(config, &test_profile, browser_lock).await?;
 
     let result: Result<(), AppError> = session.attempt_login(config, "/tmp/xost-login-test.png").await;
 
@@ -248,7 +306,8 @@ async fn run_auto_login(config: &Config) -> Result<(), AppError> {
 }
 
 async fn run_diagnose(config: &Config) -> Result<(), AppError> {
-    let session: Session = Session::launch(config).await?;
+    let browser_lock: BrowserLock = browser_lock::acquire_without_waiting(&config.db_path)?;
+    let session: Session = Session::launch(config, browser_lock).await?;
 
     let outcome: Result<(), AppError> = session.diagnose("/tmp/xost-diag.png").await;
 
@@ -274,7 +333,9 @@ fn run_enqueue(
 }
 
 async fn run_login(config: &Config) -> Result<(), AppError> {
-    browser::run_manual_login(config)?;
+    let browser_lock: BrowserLock = browser_lock::acquire_without_waiting(&config.db_path)?;
+
+    browser::run_manual_login(config, browser_lock)?;
 
     println!("browser closed; if you signed in, the session is saved for `post`");
 
@@ -293,7 +354,8 @@ async fn run_post(config: &Config) -> Result<(), AppError> {
              Confirm on X whether it posted, then clear its posting_started_at.",
             stuck_record.id,
         );
-        notify::send(&notification_title(config, "manual check needed"), &message);
+
+        alert::send(&config.account, AlertLevel::Error, &message);
 
         return Err(AppError::new(&message));
     }
@@ -354,12 +416,12 @@ async fn post_with_retries(
                     "failed before publishing on the last of {} posting attempts: {}",
                     attempt_number, error_message,
                 );
-                let message: String = mark_failed_and_notify(config, connection, tweet.id, &error_message, &failure_summary)?;
+                let message: String = mark_failed_and_alert(config, connection, tweet.id, &error_message, &failure_summary)?;
 
                 return Err(AppError::new(&message));
             }
             RetryDecision::GiveUpLeavingRecordQueued => {
-                let message: String = notify_environment_problem(config, tweet.id, &error_message);
+                let message: String = alert_environment_problem(config, tweet.id, &error_message);
 
                 return Err(AppError::new(&message));
             }
@@ -415,7 +477,7 @@ async fn attempt_post(
     tweet: &QueuedTweet,
     post_texts: &[String],
 ) -> Result<AttemptOutcome, AppError> {
-    let launch_result: Result<Session, AppError> = Session::launch(config).await;
+    let launch_result: Result<Session, AppError> = launch_post_session(config).await;
 
     let session: Session = match launch_result {
         Ok(session) => session,
@@ -434,6 +496,27 @@ async fn attempt_post(
     outcome
 }
 
+async fn launch_post_session(config: &Config) -> Result<Session, AppError> {
+    let browser_lock: BrowserLock = acquire_post_browser_lock(config).await?;
+
+    Session::launch(config, browser_lock).await
+}
+
+async fn acquire_post_browser_lock(config: &Config) -> Result<BrowserLock, AppError> {
+    let lock_path: PathBuf = browser_lock::get_lock_path(&config.db_path);
+    let acquisition: BrowserLockAcquisition =
+        browser_lock::acquire_waiting(&lock_path, browser_lock::POST_LOCK_WAIT).await?;
+
+    match acquisition {
+        BrowserLockAcquisition::Acquired(browser_lock) => Ok(browser_lock),
+        BrowserLockAcquisition::HeldElsewhere => Err(AppError::new(&format!(
+            "another xost process still held {} after {} minutes",
+            lock_path.display(),
+            browser_lock::POST_LOCK_WAIT.as_secs() / 60,
+        ))),
+    }
+}
+
 async fn post_in_session(
     session: &Session,
     config: &Config,
@@ -444,10 +527,11 @@ async fn post_in_session(
     let login_result: Result<(), AppError> = session.ensure_logged_in(config).await;
 
     if let Err(error) = login_result {
-        notify::send(
-            &notification_title(config, "sign-in needed"),
+        alert::send(
+            &config.account,
+            AlertLevel::Error,
             &format!(
-                "Could not establish a logged-in session. Run `xost --account {} login` to refresh it.",
+                "could not establish a logged-in session; run `xost --account {} login` to refresh it",
                 config.account,
             ),
         );
@@ -492,7 +576,8 @@ async fn post_in_session(
                  review to avoid a duplicate: {}",
                 tweet.id, error,
             );
-            notify::send(&notification_title(config, "manual check needed"), &message);
+
+            alert::send(&config.account, AlertLevel::Error, &message);
 
             Err(AppError::new(&message))
         }
@@ -513,14 +598,14 @@ fn split_into_thread_or_mark_failed(
         Err(error) => {
             let error_message: String = error.to_string();
             let failure_summary: String = format!("could not be split into a thread: {}", error_message);
-            let message: String = mark_failed_and_notify(config, connection, tweet.id, &error_message, &failure_summary)?;
+            let message: String = mark_failed_and_alert(config, connection, tweet.id, &error_message, &failure_summary)?;
 
             Err(AppError::new(&message))
         }
     }
 }
 
-fn mark_failed_and_notify(
+fn mark_failed_and_alert(
     config: &Config,
     connection: &rusqlite::Connection,
     tweet_id: i64,
@@ -534,24 +619,22 @@ fn mark_failed_and_notify(
          update tweet_queue set failed_at = null where id = {};",
         tweet_id, failure_summary, tweet_id,
     );
-    notify::send(&notification_title(config, "post failed; record skipped"), &message);
+
+    alert::send(&config.account, AlertLevel::Error, &message);
 
     Ok(message)
 }
 
-fn notify_environment_problem(config: &Config, tweet_id: i64, last_error: &str) -> String {
+fn alert_environment_problem(config: &Config, tweet_id: i64, last_error: &str) -> String {
     let message: String = format!(
         "the last posting attempt failed before X's composer was ready: {}. Tweet id {} was not marked failed; \
          the next run retries it.",
         last_error, tweet_id,
     );
-    notify::send(&notification_title(config, "posting environment problem"), &message);
+
+    alert::send(&config.account, AlertLevel::Warning, &message);
 
     message
-}
-
-fn notification_title(config: &Config, summary: &str) -> String {
-    format!("xost [{}]: {}", config.account, summary)
 }
 
 fn compose_post_text(tweet: &QueuedTweet, heading_separator: &str) -> String {

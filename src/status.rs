@@ -13,6 +13,11 @@ use rusqlite::params;
 
 use crate::browser::LoginState;
 use crate::browser::Session;
+use crate::browser_lock;
+use crate::browser_lock::BrowserLock;
+use crate::browser_lock::BrowserLockAcquisition;
+use crate::chrome_singleton_lock;
+use crate::chrome_singleton_lock::SingletonLockState;
 use crate::clock;
 use crate::config;
 use crate::config::Config;
@@ -21,27 +26,56 @@ use crate::config::Section;
 use crate::cron;
 use crate::cron::CronSchedule;
 use crate::cron::NextRun;
+use crate::error;
 use crate::error::AppError;
 use crate::queue;
 use crate::queue::QueuedTweet;
 use crate::queue::StuckRecord;
 use crate::schedule;
+use crate::schedule::JobKind;
 use crate::schedule::JobLoading;
 
 const CHROME_PROFILE_DIRECTORY: &str = "Default";
 const CHROME_COOKIES_FILE: &str = "Cookies";
-const CHROME_SINGLETON_LOCK_FILE: &str = "SingletonLock";
 const SESSION_COOKIE_HOST: &str = ".x.com";
 const SESSION_COOKIE_NAME: &str = "auth_token";
 // Chrome stores cookie times as microseconds since 1601-01-01T00:00:00Z.
 const MICROSECONDS_FROM_1601_TO_UNIX_EPOCH: i64 = 11_644_473_600_000_000;
-const SECONDS_PER_DAY: i64 = 86_400;
+pub const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_PREVIEW_CHARACTERS: usize = 160;
 const PREVIEW_ELLIPSIS: &str = "...";
 const DISPLAYED_TIME_FORMAT: &str = "%Y-%m-%d %H:%M %Z";
 const FIELD_INDENT: &str = "  ";
-const APP_ERROR_MESSAGE_PREFIX: &str = "Error: ";
 const STUCK_RECORD_INSTRUCTION: &str = "Confirm on X whether each stuck record posted, then clear its posting_started_at.";
+
+pub enum AccountSelection {
+    NoAccountSections,
+    Selected(SelectedAccounts),
+}
+
+pub struct SelectedAccounts {
+    account_config_sections: Vec<Section>,
+    pub now: ZonedDateTime,
+}
+
+impl SelectedAccounts {
+    pub fn account_sections(&self) -> Vec<NamedSection<'_>> {
+        config::find_named_sections(&self.account_config_sections, config::ACCOUNT_SECTION)
+    }
+}
+
+pub enum AccountSelectionError {
+    ConfigUnusable(AppError),
+    AccountAbsent(AppError),
+}
+
+impl AccountSelectionError {
+    pub fn into_app_error(self) -> AppError {
+        match self {
+            AccountSelectionError::ConfigUnusable(error) | AccountSelectionError::AccountAbsent(error) => error,
+        }
+    }
+}
 
 pub enum LoginCheckRequest {
     Skip,
@@ -52,6 +86,7 @@ pub struct AccountStatus {
     pub account: String,
     pub config_validity: ConfigValidity,
     pub schedule_status: ScheduleStatus,
+    pub check_schedule_status: ScheduleStatus,
     pub queue_status: QueueStatus,
     pub session_cookie_status: SessionCookieStatus,
     pub login_status: LoginStatus,
@@ -63,6 +98,7 @@ pub enum ConfigValidity {
 }
 
 pub struct ScheduleStatus {
+    pub job_kind: JobKind,
     pub schedule_expression: ScheduleExpression,
     pub plist_installation: PlistInstallation,
     pub job_loading: JobLoading,
@@ -142,52 +178,49 @@ pub enum LoginStatus {
 }
 
 pub async fn run(config_path: &Path, requested_account: Option<&str>, login_check_request: LoginCheckRequest) -> Result<(), AppError> {
-    let config_text: String = config::read_required_config(config_path)?;
-    let sections: Vec<Section> = config::parse(&config_text)?;
-    let account_sections: Vec<NamedSection<'_>> = select_account_sections(&sections, requested_account)?;
+    let account_selection: AccountSelection =
+        select_accounts(config_path, requested_account).map_err(AccountSelectionError::into_app_error)?;
 
-    if account_sections.is_empty() {
-        println!("the config has no {} sections", config::account_section_header("<name>"));
-
+    let AccountSelection::Selected(selected_accounts) = account_selection
+    else {
         return Ok(());
-    }
+    };
 
-    let now: ZonedDateTime = Timestamp::now().to_zoned_datetime(TimeZone::system());
+    let now: &ZonedDateTime = &selected_accounts.now;
 
-    for (account_index, account_section) in account_sections.iter().enumerate() {
-        let account_status: AccountStatus = observe_account(config_path, account_section, &now, &login_check_request).await;
+    for (account_index, account_section) in selected_accounts.account_sections().iter().enumerate() {
+        let account_status: AccountStatus = observe_account(config_path, account_section, now, &login_check_request).await;
 
         if account_index > 0 {
             println!();
         }
 
-        print!("{}", render_account_status(&account_status, &now));
+        print!("{}", render_account_status(&account_status, now));
     }
 
     Ok(())
 }
 
-pub fn select_account_sections<'a>(sections: &'a [Section], requested_account: Option<&str>) -> Result<Vec<NamedSection<'a>>, AppError> {
-    let account_sections: Vec<NamedSection<'a>> = config::find_named_sections(sections, config::ACCOUNT_SECTION);
+pub fn select_accounts(config_path: &Path, requested_account: Option<&str>) -> Result<AccountSelection, AccountSelectionError> {
+    let sections: Vec<Section> = config::read_sections(config_path).map_err(AccountSelectionError::ConfigUnusable)?;
+    let account_config_sections: Vec<Section> =
+        config::select_account_sections(sections, requested_account).map_err(AccountSelectionError::AccountAbsent)?;
 
-    let Some(requested_account) = requested_account else {
-        return Ok(account_sections);
-    };
+    if account_config_sections.is_empty() {
+        println!("the config has no {} sections", config::account_section_header("<name>"));
 
-    let requested_section: Option<NamedSection<'a>> =
-        account_sections.into_iter().find(|account_section| account_section.name == requested_account);
-
-    match requested_section {
-        Some(account_section) => Ok(vec![account_section]),
-        None => Err(AppError::new(&format!(
-            "no {} section in config; defined accounts: {}",
-            config::account_section_header(requested_account),
-            config::account_names(sections),
-        ))),
+        return Ok(AccountSelection::NoAccountSections);
     }
+
+    let now: ZonedDateTime = Timestamp::now().to_zoned_datetime(TimeZone::system());
+
+    Ok(AccountSelection::Selected(SelectedAccounts {
+        account_config_sections,
+        now,
+    }))
 }
 
-async fn observe_account(
+pub async fn observe_account(
     config_path: &Path,
     account_section: &NamedSection<'_>,
     now: &ZonedDateTime,
@@ -197,10 +230,11 @@ async fn observe_account(
 
     let config_validity: ConfigValidity = match &config_load {
         Ok(_) => ConfigValidity::Valid,
-        Err(error) => ConfigValidity::Invalid(get_error_message(error)),
+        Err(error) => ConfigValidity::Invalid(error::get_error_message(error)),
     };
 
-    let schedule_status: ScheduleStatus = observe_schedule(account_section, now);
+    let schedule_status: ScheduleStatus = observe_schedule(account_section, JobKind::Post, now);
+    let check_schedule_status: ScheduleStatus = observe_schedule(account_section, JobKind::Check, now);
     let queue_status: QueueStatus = observe_queue(account_section.values);
     let session_cookie_status: SessionCookieStatus = observe_session_cookie(account_section.values);
     let login_status: LoginStatus = observe_login(&config_load, login_check_request).await;
@@ -209,14 +243,15 @@ async fn observe_account(
         account: account_section.name.to_string(),
         config_validity,
         schedule_status,
+        check_schedule_status,
         queue_status,
         session_cookie_status,
         login_status,
     }
 }
 
-fn observe_schedule(account_section: &NamedSection<'_>, now: &ZonedDateTime) -> ScheduleStatus {
-    let label: String = schedule::job_label(account_section.name);
+fn observe_schedule(account_section: &NamedSection<'_>, job_kind: JobKind, now: &ZonedDateTime) -> ScheduleStatus {
+    let label: String = schedule::job_label(account_section.name, job_kind);
     let installed_plist_path: String = schedule::installed_plist_path(&label);
     let plist_present: bool = Path::new(&installed_plist_path).exists();
 
@@ -226,14 +261,15 @@ fn observe_schedule(account_section: &NamedSection<'_>, now: &ZonedDateTime) -> 
     };
 
     ScheduleStatus {
-        schedule_expression: get_schedule_expression(account_section.values, now),
+        job_kind,
+        schedule_expression: get_schedule_expression(account_section.values, job_kind.schedule_key(), now),
         plist_installation,
         job_loading: schedule::read_job_loading(&label),
     }
 }
 
-fn get_schedule_expression(account_values: &BTreeMap<String, String>, now: &ZonedDateTime) -> ScheduleExpression {
-    let Some(expression) = account_values.get(config::SCHEDULE_KEY) else {
+fn get_schedule_expression(account_values: &BTreeMap<String, String>, schedule_key: &str, now: &ZonedDateTime) -> ScheduleExpression {
+    let Some(expression) = account_values.get(schedule_key) else {
         return ScheduleExpression::Absent;
     };
 
@@ -276,7 +312,7 @@ fn observe_queue_state(db_path: &Path) -> QueueState {
 
     let queue_state_result: Result<QueueState, AppError> = read_queue_state(&connection);
 
-    queue_state_result.unwrap_or_else(|error| QueueState::Unreadable(get_error_message(&error)))
+    queue_state_result.unwrap_or_else(|error| QueueState::Unreadable(error::get_error_message(&error)))
 }
 
 fn read_queue_state(connection: &Connection) -> Result<QueueState, AppError> {
@@ -384,7 +420,7 @@ fn observe_session_cookie(account_values: &BTreeMap<String, String>) -> SessionC
 
     let read_result: Result<SessionCookieStatus, AppError> = read_session_cookie(&cookies_path);
 
-    read_result.unwrap_or_else(|error| SessionCookieStatus::Unreadable(get_error_message(&error)))
+    read_result.unwrap_or_else(|error| SessionCookieStatus::Unreadable(error::get_error_message(&error)))
 }
 
 // immutable=1 reads without locking; a running Chrome holds this database's lock exclusively.
@@ -450,18 +486,30 @@ async fn check_login(config: &Config) -> LoginStatus {
         return LoginStatus::NotCheckable("the Chrome profile directory does not exist".to_string());
     }
 
-    let singleton_lock_metadata: std::io::Result<std::fs::Metadata> =
-        std::fs::symlink_metadata(config.profile_dir.join(CHROME_SINGLETON_LOCK_FILE));
+    let lock_path: PathBuf = browser_lock::get_lock_path(&config.db_path);
+    let lock_result: Result<BrowserLockAcquisition, AppError> = browser_lock::try_acquire(&lock_path);
 
-    if singleton_lock_metadata.is_ok() {
+    let browser_lock: BrowserLock = match lock_result {
+        Ok(BrowserLockAcquisition::Acquired(browser_lock)) => browser_lock,
+        Ok(BrowserLockAcquisition::HeldElsewhere) => {
+            return LoginStatus::NotCheckable("the Chrome profile is in use by another xost process".to_string());
+        }
+        Err(error) => return LoginStatus::CheckFailed(error::get_error_message(&error)),
+    };
+
+    let singleton_lock_state: SingletonLockState = chrome_singleton_lock::read_singleton_lock_state(&config.profile_dir);
+
+    if singleton_lock_state == SingletonLockState::Held {
+        browser_lock.release().ok();
+
         return LoginStatus::NotCheckable("the Chrome profile is in use by another Chrome process".to_string());
     }
 
-    let launch_result: Result<Session, AppError> = Session::launch(config).await;
+    let launch_result: Result<Session, AppError> = Session::launch(config, browser_lock).await;
 
     let session: Session = match launch_result {
         Ok(session) => session,
-        Err(error) => return LoginStatus::CheckFailed(format!("could not launch Chrome: {}", get_error_message(&error))),
+        Err(error) => return LoginStatus::CheckFailed(format!("could not launch Chrome: {}", error::get_error_message(&error))),
     };
 
     let login_state_result: Result<LoginState, AppError> = session.observe_login_state().await;
@@ -471,7 +519,7 @@ async fn check_login(config: &Config) -> LoginStatus {
     match login_state_result {
         Ok(LoginState::LoggedIn) => LoginStatus::LoggedIn,
         Ok(LoginState::LoggedOut) => LoginStatus::LoggedOut,
-        Err(error) => LoginStatus::CheckFailed(get_error_message(&error)),
+        Err(error) => LoginStatus::CheckFailed(error::get_error_message(&error)),
     }
 }
 
@@ -481,6 +529,7 @@ pub fn render_account_status(account_status: &AccountStatus, now: &ZonedDateTime
 
     push_field(&mut lines, "Config", &render_config_validity(&account_status.config_validity));
     push_schedule_fields(&mut lines, &account_status.schedule_status, time_zone);
+    push_schedule_fields(&mut lines, &account_status.check_schedule_status, time_zone);
     push_queue_fields(&mut lines, &account_status.queue_status, time_zone);
     push_field(&mut lines, "Session cookie", &render_session_cookie_status(&account_status.session_cookie_status, now));
 
@@ -505,15 +554,41 @@ fn render_config_validity(config_validity: &ConfigValidity) -> String {
     }
 }
 
+struct ScheduleFieldLabels {
+    schedule: &'static str,
+    next_run: &'static str,
+    plist: &'static str,
+    job: &'static str,
+}
+
+fn get_schedule_field_labels(job_kind: JobKind) -> ScheduleFieldLabels {
+    match job_kind {
+        JobKind::Post => ScheduleFieldLabels {
+            schedule: "Schedule",
+            next_run: "Next run",
+            plist: "Plist",
+            job: "Job",
+        },
+        JobKind::Check => ScheduleFieldLabels {
+            schedule: "Check schedule",
+            next_run: "Check next run",
+            plist: "Check plist",
+            job: "Check job",
+        },
+    }
+}
+
 fn push_schedule_fields(lines: &mut Vec<String>, schedule_status: &ScheduleStatus, time_zone: &TimeZone) {
+    let field_labels: ScheduleFieldLabels = get_schedule_field_labels(schedule_status.job_kind);
+
     match &schedule_status.schedule_expression {
-        ScheduleExpression::Absent => push_field(lines, "Schedule", "none"),
+        ScheduleExpression::Absent => push_field(lines, field_labels.schedule, "none"),
         ScheduleExpression::Invalid { expression } => {
-            push_field(lines, "Schedule", &format!("{} (invalid; see Config)", expression));
+            push_field(lines, field_labels.schedule, &format!("{} (invalid; see Config)", expression));
         }
         ScheduleExpression::Valid { expression, next_run } => {
-            push_field(lines, "Schedule", expression);
-            push_field(lines, "Next run", &render_next_run(next_run, time_zone));
+            push_field(lines, field_labels.schedule, expression);
+            push_field(lines, field_labels.next_run, &render_next_run(next_run, time_zone));
         }
     }
 
@@ -522,7 +597,7 @@ fn push_schedule_fields(lines: &mut Vec<String>, schedule_status: &ScheduleStatu
         PlistInstallation::NotInstalled => "not installed".to_string(),
     };
 
-    push_field(lines, "Plist", &plist_installation);
+    push_field(lines, field_labels.plist, &plist_installation);
 
     let job_loading: &str = match schedule_status.job_loading {
         JobLoading::Loaded => "loaded",
@@ -530,7 +605,7 @@ fn push_schedule_fields(lines: &mut Vec<String>, schedule_status: &ScheduleStatu
         JobLoading::Unknown => "unknown",
     };
 
-    push_field(lines, "Job", job_loading);
+    push_field(lines, field_labels.job, job_loading);
 }
 
 fn render_next_run(next_run: &NextRun, time_zone: &TimeZone) -> String {
@@ -654,14 +729,18 @@ fn render_session_cookie_status(session_cookie_status: &SessionCookieStatus, now
     }
 }
 
-fn render_cookie_expiry(expiry: Timestamp, now: &ZonedDateTime) -> String {
+pub fn render_cookie_expiry(expiry: Timestamp, now: &ZonedDateTime) -> String {
     let expiry_display: String = render_time(expiry, now.time_zone());
-    let seconds_until_expiry: i64 = expiry.as_second() - now.timestamp().as_second();
+    let seconds_until_expiry: i64 = get_seconds_until_expiry(expiry, now);
 
     match seconds_until_expiry > 0 {
         true => format!("expires {}, {} days left", expiry_display, seconds_until_expiry / SECONDS_PER_DAY),
-        false => format!("expired {}, {} days ago", expiry_display, -seconds_until_expiry / SECONDS_PER_DAY),
+        false => format!("expired {}", expiry_display),
     }
+}
+
+pub fn get_seconds_until_expiry(expiry: Timestamp, now: &ZonedDateTime) -> i64 {
+    expiry.as_second() - now.timestamp().as_second()
 }
 
 fn render_login_status(login_status: &LoginStatus) -> Option<String> {
@@ -687,12 +766,6 @@ fn render_stored_time(stored_time: &str, time_zone: &TimeZone) -> String {
     }
 }
 
-fn get_error_message(error: &AppError) -> String {
-    let message: &str = error.message.strip_prefix(APP_ERROR_MESSAGE_PREFIX).unwrap_or(&error.message);
-
-    message.to_string()
-}
-
 pub fn get_single_line_preview(text: &str) -> String {
     let single_line: String = text.split_whitespace().collect::<Vec<&str>>().join(" ");
     let character_count: usize = single_line.chars().count();
@@ -710,45 +783,11 @@ pub fn get_single_line_preview(text: &str) -> String {
 mod tests {
     use super::*;
 
-    const SAMPLE_CONFIG: &str = "\
-[secrets]
-  store = /tmp/secrets.yaml
-  key = AAAABBBB
-
-[account \"first\"]
-  handle = first_handle
-
-[account \"second\"]
-  handle = second_handle
-";
-
     fn create_fresh_queue() -> Connection {
         let connection: Connection = Connection::open_in_memory().unwrap();
         queue::init_schema(&connection).unwrap();
 
         connection
-    }
-
-    fn get_selected_account_names(requested_account: Option<&str>) -> Result<Vec<String>, AppError> {
-        let sections: Vec<Section> = config::parse(SAMPLE_CONFIG).unwrap();
-        let account_sections: Vec<NamedSection<'_>> = select_account_sections(&sections, requested_account)?;
-
-        Ok(account_sections.into_iter().map(|account_section| account_section.name.to_string()).collect())
-    }
-
-    #[test]
-    fn select_account_sections_returns_every_account_in_file_order_without_a_requested_account() {
-        assert_eq!(get_selected_account_names(None).unwrap(), vec!["first", "second"]);
-    }
-
-    #[test]
-    fn select_account_sections_returns_only_the_requested_account() {
-        assert_eq!(get_selected_account_names(Some("second")).unwrap(), vec!["second"]);
-    }
-
-    #[test]
-    fn select_account_sections_rejects_an_absent_account() {
-        assert!(get_selected_account_names(Some("missing")).is_err());
     }
 
     #[test]
@@ -861,12 +900,22 @@ mod tests {
             account: "daily".to_string(),
             config_validity: ConfigValidity::Valid,
             schedule_status: ScheduleStatus {
+                job_kind: JobKind::Post,
                 schedule_expression: ScheduleExpression::Valid {
                     expression: "0 9 * * *".to_string(),
                     next_run: NextRun::At(clock::get_utc_time("2026-11-16T09:00:00Z")),
                 },
                 plist_installation: PlistInstallation::Installed("/Library/LaunchDaemons/ro.zach.xost.daily.plist".to_string()),
                 job_loading: JobLoading::Loaded,
+            },
+            check_schedule_status: ScheduleStatus {
+                job_kind: JobKind::Check,
+                schedule_expression: ScheduleExpression::Valid {
+                    expression: "30 8 * * *".to_string(),
+                    next_run: NextRun::At(clock::get_utc_time("2026-11-16T08:30:00Z")),
+                },
+                plist_installation: PlistInstallation::NotInstalled,
+                job_loading: JobLoading::NotLoaded,
             },
             queue_status: QueueStatus::Configured {
                 db_path: PathBuf::from("/tmp/daily/queue.db"),
@@ -910,6 +959,10 @@ daily
   Next run: 2026-11-16 09:00 UTC
   Plist: installed at /Library/LaunchDaemons/ro.zach.xost.daily.plist
   Job: loaded
+  Check schedule: 30 8 * * *
+  Check next run: 2026-11-16 08:30 UTC
+  Check plist: not installed
+  Check job: not loaded
   Queue: /tmp/daily/queue.db
   Records: 3 total, 3 enabled, 0 disabled, 1 posted, 2 never posted, 1 failed
   Next record: id 2, order 2, heading \"2.\"

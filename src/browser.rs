@@ -19,6 +19,7 @@ use chromiumoxide::cdp::browser_protocol::network::TimeSinceEpoch;
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use futures::StreamExt;
 
+use crate::browser_lock::BrowserLock;
 use crate::clock;
 use crate::config::Config;
 use crate::error::AppError;
@@ -60,44 +61,30 @@ pub struct Session {
     browser: Browser,
     page: Page,
     handler_task: tokio::task::JoinHandle<()>,
+    browser_lock: BrowserLock,
 }
 
 impl Session {
-    pub async fn launch(config: &Config) -> Result<Session, AppError> {
-        Session::launch_with_profile(config, &config.profile_dir).await
+    pub async fn launch(config: &Config, browser_lock: BrowserLock) -> Result<Session, AppError> {
+        Session::launch_with_profile(config, &config.profile_dir, browser_lock).await
     }
 
-    pub async fn launch_with_profile(config: &Config, profile_dir: &std::path::Path) -> Result<Session, AppError> {
-        std::fs::create_dir_all(profile_dir)?;
+    pub async fn launch_with_profile(
+        config: &Config,
+        profile_dir: &std::path::Path,
+        browser_lock: BrowserLock,
+    ) -> Result<Session, AppError> {
+        let launch_result: Result<LaunchedBrowser, AppError> = launch_browser(config, profile_dir).await;
 
-        let mut builder: BrowserConfigBuilder = BrowserConfig::builder()
-            .user_data_dir(profile_dir)
-            .window_size(1280, 900)
-            .new_headless_mode()
-            .request_timeout(Duration::from_secs(60))
-            .arg("--disable-blink-features=AutomationControlled");
-
-        if let Some(chrome_path) = &config.chrome_path {
-            builder = builder.chrome_executable(chrome_path);
-        }
-
-        let browser_config: BrowserConfig = builder.build().map_err(|message| AppError::new(&message))?;
-
-        let (mut browser, mut handler) = Browser::launch(browser_config).await?;
-        let handler_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-            while handler.next().await.is_some() {}
-        });
-
-        let page_preparation: Result<Page, AppError> = prepare_page(&browser).await;
-
-        match page_preparation {
-            Ok(page) => Ok(Session {
-                browser,
-                page,
-                handler_task,
+        match launch_result {
+            Ok(launched_browser) => Ok(Session {
+                browser: launched_browser.browser,
+                page: launched_browser.page,
+                handler_task: launched_browser.handler_task,
+                browser_lock,
             }),
             Err(error) => {
-                shut_down_browser(&mut browser, handler_task).await.ok();
+                browser_lock.release().ok();
 
                 Err(error)
             }
@@ -247,7 +234,11 @@ impl Session {
     }
 
     pub async fn close(mut self) -> Result<(), AppError> {
-        shut_down_browser(&mut self.browser, self.handler_task).await
+        let shutdown_result: Result<(), AppError> = shut_down_browser(&mut self.browser, self.handler_task).await;
+
+        self.browser_lock.release()?;
+
+        shutdown_result
     }
 
     async fn is_logged_in(&self) -> bool {
@@ -570,6 +561,49 @@ fn generate_totp_code(seed_base32: &str) -> Result<String, AppError> {
     Ok(code)
 }
 
+struct LaunchedBrowser {
+    browser: Browser,
+    page: Page,
+    handler_task: tokio::task::JoinHandle<()>,
+}
+
+async fn launch_browser(config: &Config, profile_dir: &std::path::Path) -> Result<LaunchedBrowser, AppError> {
+    std::fs::create_dir_all(profile_dir)?;
+
+    let mut builder: BrowserConfigBuilder = BrowserConfig::builder()
+        .user_data_dir(profile_dir)
+        .window_size(1280, 900)
+        .new_headless_mode()
+        .request_timeout(Duration::from_secs(60))
+        .arg("--disable-blink-features=AutomationControlled");
+
+    if let Some(chrome_path) = &config.chrome_path {
+        builder = builder.chrome_executable(chrome_path);
+    }
+
+    let browser_config: BrowserConfig = builder.build().map_err(|message| AppError::new(&message))?;
+
+    let (mut browser, mut handler) = Browser::launch(browser_config).await?;
+    let handler_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+        while handler.next().await.is_some() {}
+    });
+
+    let page_preparation: Result<Page, AppError> = prepare_page(&browser).await;
+
+    match page_preparation {
+        Ok(page) => Ok(LaunchedBrowser {
+            browser,
+            page,
+            handler_task,
+        }),
+        Err(error) => {
+            shut_down_browser(&mut browser, handler_task).await.ok();
+
+            Err(error)
+        }
+    }
+}
+
 async fn prepare_page(browser: &Browser) -> Result<Page, AppError> {
     let page: Page = browser.new_page("about:blank").await?;
 
@@ -639,7 +673,15 @@ async fn apply_user_agent(page: &Page) -> Result<(), AppError> {
     Ok(())
 }
 
-pub fn run_manual_login(config: &Config) -> Result<(), AppError> {
+pub fn run_manual_login(config: &Config, browser_lock: BrowserLock) -> Result<(), AppError> {
+    let login_result: Result<(), AppError> = run_manual_login_browser(config);
+
+    browser_lock.release()?;
+
+    login_result
+}
+
+fn run_manual_login_browser(config: &Config) -> Result<(), AppError> {
     std::fs::create_dir_all(&config.profile_dir)?;
 
     let chrome: PathBuf = resolve_chrome(config)?;

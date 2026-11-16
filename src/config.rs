@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::cron::CronSchedule;
+use crate::error;
 use crate::error::AppError;
 use crate::private_file;
 use crate::secrets;
@@ -23,6 +24,7 @@ pub const DB_KEY: &str = "db";
 pub const PROFILE_KEY: &str = "profile";
 pub const CHROME_KEY: &str = "chrome";
 pub const SCHEDULE_KEY: &str = "schedule";
+pub const CHECK_SCHEDULE_KEY: &str = "check_schedule";
 pub const HEADING_SEPARATOR_KEY: &str = "heading_separator";
 pub const THREAD_POST_LIMIT_KEY: &str = "thread_post_limit";
 pub const THREAD_MAX_POSTS_KEY: &str = "thread_max_posts";
@@ -44,25 +46,23 @@ pub struct Config {
     pub heading_separator: String,
     pub thread_settings: ThreadSettings,
     pub schedule: Option<CronSchedule>,
+    pub check_schedule: Option<CronSchedule>,
 }
 
 impl Config {
     pub fn load(config_path: &std::path::Path, account: &str) -> Result<Self, AppError> {
+        let sections: Vec<Section> = read_sections(config_path)?;
+
+        Config::from_sections(&sections, account)
+    }
+
+    pub fn from_sections(sections: &[Section], account: &str) -> Result<Self, AppError> {
         validate_account_name(account)?;
 
-        let contents: String = read_required_config(config_path)?;
+        let account_values: &BTreeMap<String, String> = find_section(sections, ACCOUNT_SECTION, Some(account))
+            .ok_or_else(|| get_absent_account_error(account, sections))?;
 
-        let sections: Vec<Section> = parse(&contents)?;
-
-        let account_values: &BTreeMap<String, String> = find_section(&sections, ACCOUNT_SECTION, Some(account)).ok_or_else(|| {
-            AppError::new(&format!(
-                "no {} section in config; defined accounts: {}",
-                account_section_header(account),
-                account_names(&sections),
-            ))
-        })?;
-
-        let secrets_values: &BTreeMap<String, String> = find_section(&sections, SECRETS_SECTION, None).ok_or_else(|| {
+        let secrets_values: &BTreeMap<String, String> = find_section(sections, SECRETS_SECTION, None).ok_or_else(|| {
             AppError::new(&format!(
                 "config has no {} section (expected keys: {}, {})",
                 secrets_section_header(),
@@ -83,7 +83,8 @@ impl Config {
             None => DEFAULT_HEADING_SEPARATOR.to_string(),
         };
         let thread_settings: ThreadSettings = parse_thread_settings(account_values)?;
-        let schedule: Option<CronSchedule> = parse_schedule(account_values)?;
+        let schedule: Option<CronSchedule> = parse_schedule(account_values, SCHEDULE_KEY)?;
+        let check_schedule: Option<CronSchedule> = parse_schedule(account_values, CHECK_SCHEDULE_KEY)?;
 
         Ok(Config {
             account: account.to_string(),
@@ -99,16 +100,18 @@ impl Config {
             heading_separator,
             thread_settings,
             schedule,
+            check_schedule,
         })
     }
 }
 
-fn parse_schedule(account_values: &BTreeMap<String, String>) -> Result<Option<CronSchedule>, AppError> {
-    let Some(raw) = account_values.get(SCHEDULE_KEY) else {
+fn parse_schedule(account_values: &BTreeMap<String, String>, key: &str) -> Result<Option<CronSchedule>, AppError> {
+    let Some(raw) = account_values.get(key) else {
         return Ok(None);
     };
 
-    let schedule: CronSchedule = CronSchedule::parse(raw)?;
+    let schedule: CronSchedule =
+        CronSchedule::parse(raw).map_err(|error| AppError::new(&format!("{}: {}", key, error::get_error_message(&error))))?;
 
     Ok(Some(schedule))
 }
@@ -226,7 +229,13 @@ pub fn default_config_path() -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(home).join(".config").join("xost").join("config"))
 }
 
-pub fn read_required_config(config_path: &std::path::Path) -> Result<String, AppError> {
+pub fn read_sections(config_path: &std::path::Path) -> Result<Vec<Section>, AppError> {
+    let contents: String = read_required_config(config_path)?;
+
+    parse(&contents)
+}
+
+fn read_required_config(config_path: &std::path::Path) -> Result<String, AppError> {
     std::fs::read_to_string(config_path).map_err(|error| get_config_read_error(config_path, &error))
 }
 
@@ -344,6 +353,32 @@ pub fn find_named_sections<'a>(sections: &'a [Section], kind: &str) -> Vec<Named
             })
         })
         .collect()
+}
+
+pub fn select_account_sections(sections: Vec<Section>, requested_account: Option<&str>) -> Result<Vec<Section>, AppError> {
+    if let Some(account) = requested_account {
+        let requested_section_present: bool = find_section(&sections, ACCOUNT_SECTION, Some(account)).is_some();
+
+        if !requested_section_present {
+            return Err(get_absent_account_error(account, &sections));
+        }
+    }
+
+    let account_sections: Vec<Section> = sections
+        .into_iter()
+        .filter(|section| section.kind == ACCOUNT_SECTION && section.name.is_some())
+        .filter(|section| requested_account.is_none() || section.name.as_deref() == requested_account)
+        .collect();
+
+    Ok(account_sections)
+}
+
+fn get_absent_account_error(account: &str, sections: &[Section]) -> AppError {
+    AppError::new(&format!(
+        "no {} section in config; defined accounts: {}",
+        account_section_header(account),
+        account_names(sections),
+    ))
 }
 
 pub fn account_names(sections: &[Section]) -> String {
@@ -549,6 +584,46 @@ mod tests {
         let contents: String = format!("{}  schedule = 0 9 * * MON\n", SAMPLE);
 
         assert!(get_config_from(&contents, "gimmick2").is_err());
+    }
+
+    #[test]
+    fn load_parses_the_check_schedule() {
+        let contents: String = format!("{}  check_schedule = 30 8 * * *\n", SAMPLE);
+
+        let config: Config = get_config_from(&contents, "gimmick2").unwrap();
+
+        assert_eq!(config.check_schedule, Some(CronSchedule::parse("30 8 * * *").unwrap()));
+    }
+
+    #[test]
+    fn load_rejects_an_invalid_check_schedule_naming_its_key() {
+        let contents: String = format!("{}  check_schedule = 0 9 * * MON\n", SAMPLE);
+
+        let error: AppError = get_config_from(&contents, "gimmick2").err().unwrap();
+
+        assert!(error.message.contains(CHECK_SCHEDULE_KEY));
+    }
+
+    fn get_selected_account_names(requested_account: Option<&str>) -> Result<Vec<String>, AppError> {
+        let sections: Vec<Section> = parse(SAMPLE).unwrap();
+        let account_sections: Vec<Section> = select_account_sections(sections, requested_account)?;
+
+        Ok(account_sections.into_iter().filter_map(|account_section| account_section.name).collect())
+    }
+
+    #[test]
+    fn select_account_sections_returns_every_account_in_file_order_without_a_requested_account() {
+        assert_eq!(get_selected_account_names(None).unwrap(), vec!["gimmick1", "gimmick2"]);
+    }
+
+    #[test]
+    fn select_account_sections_returns_only_the_requested_account() {
+        assert_eq!(get_selected_account_names(Some("gimmick2")).unwrap(), vec!["gimmick2"]);
+    }
+
+    #[test]
+    fn select_account_sections_rejects_an_absent_account() {
+        assert!(get_selected_account_names(Some("missing")).is_err());
     }
 
     #[test]

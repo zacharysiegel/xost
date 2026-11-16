@@ -2,12 +2,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::browser_lock;
 use crate::config;
 use crate::config::Section;
 use crate::error::AppError;
 use crate::private_file;
 use crate::prompt;
 use crate::schedule;
+use crate::schedule::JobKind;
 use crate::secrets;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -23,10 +25,16 @@ pub enum Confirmation {
 }
 
 pub struct ObservedAccount {
-    pub installed_plist_path: Option<String>,
+    pub installed_scheduled_jobs: Vec<InstalledScheduledJob>,
     pub secrets_store: Option<ObservedSecretsStore>,
     pub account_section: Option<ObservedAccountSection>,
     pub other_account_data_paths: Vec<OtherAccountDataPath>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct InstalledScheduledJob {
+    pub label: String,
+    pub installed_plist_path: String,
 }
 
 pub struct OtherAccountDataPath {
@@ -41,12 +49,13 @@ pub struct ObservedSecretsStore {
 
 pub struct ObservedAccountSection {
     pub existing_db_path: Option<PathBuf>,
+    pub existing_browser_lock_path: Option<PathBuf>,
     pub existing_profile_dir: Option<PathBuf>,
 }
 
 impl ObservedAccountSection {
     fn existing_data_paths(&self) -> Vec<PathBuf> {
-        [&self.existing_db_path, &self.existing_profile_dir]
+        [&self.existing_db_path, &self.existing_browser_lock_path, &self.existing_profile_dir]
             .into_iter()
             .flatten()
             .cloned()
@@ -56,10 +65,7 @@ impl ObservedAccountSection {
 
 #[derive(Debug, PartialEq)]
 pub enum DeregisterStep {
-    RemoveScheduledJob {
-        account: String,
-        installed_plist_path: String,
-    },
+    RemoveScheduledJob(InstalledScheduledJob),
     RemoveSecrets {
         store_path: PathBuf,
         secret_names: Vec<String>,
@@ -70,6 +76,9 @@ pub enum DeregisterStep {
     },
     DeleteDatabaseFile {
         db_path: PathBuf,
+    },
+    DeleteBrowserLockFile {
+        lock_path: PathBuf,
     },
     DeleteProfileDirectory {
         profile_dir: PathBuf,
@@ -83,9 +92,10 @@ impl DeregisterStep {
     fn deleted_data_path(&self) -> Option<&Path> {
         match self {
             DeregisterStep::DeleteDatabaseFile { db_path } => Some(db_path),
+            DeregisterStep::DeleteBrowserLockFile { lock_path } => Some(lock_path),
             DeregisterStep::DeleteProfileDirectory { profile_dir } => Some(profile_dir),
             DeregisterStep::DeleteDirectoryIfEmpty { directory } => Some(directory),
-            DeregisterStep::RemoveScheduledJob { .. }
+            DeregisterStep::RemoveScheduledJob(_)
             | DeregisterStep::RemoveSecrets { .. }
             | DeregisterStep::RemoveAccountSection { .. } => None,
         }
@@ -93,9 +103,9 @@ impl DeregisterStep {
 
     fn description(&self) -> String {
         match self {
-            DeregisterStep::RemoveScheduledJob {
-                installed_plist_path, ..
-            } => format!("the scheduled job {}", installed_plist_path),
+            DeregisterStep::RemoveScheduledJob(installed_scheduled_job) => {
+                format!("the scheduled job {}", installed_scheduled_job.installed_plist_path)
+            }
             DeregisterStep::RemoveSecrets {
                 store_path,
                 secret_names,
@@ -104,6 +114,7 @@ impl DeregisterStep {
                 format!("the {} section of {}", config::account_section_header(account), config_path.display())
             }
             DeregisterStep::DeleteDatabaseFile { db_path } => format!("the queue database {}", db_path.display()),
+            DeregisterStep::DeleteBrowserLockFile { lock_path } => format!("the browser lock file {}", lock_path.display()),
             DeregisterStep::DeleteProfileDirectory { profile_dir } => {
                 format!("the Chrome profile directory {}", profile_dir.display())
             }
@@ -175,20 +186,37 @@ pub fn run(config_path: &Path, account: &str, data_handling: DataHandling) -> Re
 }
 
 fn observe_account(account: &str, sections: &[Section]) -> Result<ObservedAccount, AppError> {
-    let installed_plist_path: String = schedule::installed_plist_path(&schedule::job_label(account));
-    let installed_plist_present: bool = Path::new(&installed_plist_path).exists();
-
+    let installed_scheduled_jobs: Vec<InstalledScheduledJob> = observe_installed_scheduled_jobs(account);
     let secrets_store: Option<ObservedSecretsStore> = observe_secrets_store(sections)?;
     let account_section: Option<ObservedAccountSection> =
         config::find_section(sections, config::ACCOUNT_SECTION, Some(account)).map(observe_account_section);
     let other_account_data_paths: Vec<OtherAccountDataPath> = observe_other_account_data_paths(account, sections);
 
     Ok(ObservedAccount {
-        installed_plist_path: installed_plist_present.then_some(installed_plist_path),
+        installed_scheduled_jobs,
         secrets_store,
         account_section,
         other_account_data_paths,
     })
+}
+
+fn observe_installed_scheduled_jobs(account: &str) -> Vec<InstalledScheduledJob> {
+    let mut installed_scheduled_jobs: Vec<InstalledScheduledJob> = Vec::new();
+
+    for job_kind in JobKind::ALL {
+        let label: String = schedule::job_label(account, job_kind);
+        let installed_plist_path: String = schedule::installed_plist_path(&label);
+        let installed_plist_present: bool = Path::new(&installed_plist_path).exists();
+
+        if installed_plist_present {
+            installed_scheduled_jobs.push(InstalledScheduledJob {
+                label,
+                installed_plist_path,
+            });
+        }
+    }
+
+    installed_scheduled_jobs
 }
 
 fn observe_other_account_data_paths(account: &str, sections: &[Section]) -> Vec<OtherAccountDataPath> {
@@ -199,12 +227,7 @@ fn observe_other_account_data_paths(account: &str, sections: &[Section]) -> Vec<
             continue;
         }
 
-        for key in [config::DB_KEY, config::PROFILE_KEY] {
-            let Some(data_path) = config::get_configured_path(account_section.values, key)
-            else {
-                continue;
-            };
-
+        for data_path in get_configured_data_paths(account_section.values) {
             other_account_data_paths.push(OtherAccountDataPath {
                 account: account_section.name.to_string(),
                 data_path,
@@ -213,6 +236,14 @@ fn observe_other_account_data_paths(account: &str, sections: &[Section]) -> Vec<
     }
 
     other_account_data_paths
+}
+
+fn get_configured_data_paths(account_values: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    let db_path: Option<PathBuf> = config::get_configured_path(account_values, config::DB_KEY);
+    let browser_lock_path: Option<PathBuf> = db_path.as_deref().map(browser_lock::get_lock_path);
+    let profile_dir: Option<PathBuf> = config::get_configured_path(account_values, config::PROFILE_KEY);
+
+    [db_path, browser_lock_path, profile_dir].into_iter().flatten().collect()
 }
 
 fn observe_secrets_store(sections: &[Section]) -> Result<Option<ObservedSecretsStore>, AppError> {
@@ -232,14 +263,19 @@ fn observe_secrets_store(sections: &[Section]) -> Result<Option<ObservedSecretsS
 }
 
 fn observe_account_section(account_values: &BTreeMap<String, String>) -> ObservedAccountSection {
+    let configured_db_path: Option<PathBuf> = config::get_configured_path(account_values, config::DB_KEY);
+    let configured_browser_lock_path: Option<PathBuf> = configured_db_path.as_deref().map(browser_lock::get_lock_path);
+    let configured_profile_dir: Option<PathBuf> = config::get_configured_path(account_values, config::PROFILE_KEY);
+
     ObservedAccountSection {
-        existing_db_path: get_existing_configured_path(account_values, config::DB_KEY),
-        existing_profile_dir: get_existing_configured_path(account_values, config::PROFILE_KEY),
+        existing_db_path: get_existing_path(configured_db_path),
+        existing_browser_lock_path: get_existing_path(configured_browser_lock_path),
+        existing_profile_dir: get_existing_path(configured_profile_dir),
     }
 }
 
-fn get_existing_configured_path(values: &BTreeMap<String, String>, key: &str) -> Option<PathBuf> {
-    let path: PathBuf = config::get_configured_path(values, key)?;
+fn get_existing_path(configured_path: Option<PathBuf>) -> Option<PathBuf> {
+    let path: PathBuf = configured_path?;
     let path_exists: bool = path.exists();
 
     path_exists.then_some(path)
@@ -254,11 +290,8 @@ pub fn build_plan(
     let mut steps: Vec<DeregisterStep> = Vec::new();
     let mut kept_data_paths: Vec<KeptDataPath> = Vec::new();
 
-    if let Some(installed_plist_path) = observed_account.installed_plist_path {
-        steps.push(DeregisterStep::RemoveScheduledJob {
-            account: account.to_string(),
-            installed_plist_path,
-        });
+    for installed_scheduled_job in observed_account.installed_scheduled_jobs {
+        steps.push(DeregisterStep::RemoveScheduledJob(installed_scheduled_job));
     }
 
     if let Some(secrets_store) = observed_account.secrets_store {
@@ -370,6 +403,12 @@ fn get_data_deletion_steps(account_section: &ObservedAccountSection) -> Vec<Dere
         steps.push(DeregisterStep::DeleteDatabaseFile { db_path: db_path.clone() });
     }
 
+    if let Some(lock_path) = &account_section.existing_browser_lock_path {
+        steps.push(DeregisterStep::DeleteBrowserLockFile {
+            lock_path: lock_path.clone(),
+        });
+    }
+
     if let Some(profile_dir) = &account_section.existing_profile_dir {
         steps.push(DeregisterStep::DeleteProfileDirectory {
             profile_dir: profile_dir.clone(),
@@ -457,13 +496,16 @@ fn execute_plan(steps: &[DeregisterStep]) -> Result<(), AppError> {
 
 fn execute_step(step: &DeregisterStep) -> Result<StepOutcome, AppError> {
     match step {
-        DeregisterStep::RemoveScheduledJob { account, .. } => schedule::remove(account)?,
+        DeregisterStep::RemoveScheduledJob(installed_scheduled_job) => {
+            schedule::remove_job(&installed_scheduled_job.label, &installed_scheduled_job.installed_plist_path)?
+        }
         DeregisterStep::RemoveSecrets {
             store_path,
             secret_names,
         } => remove_secrets_from_store(store_path, secret_names)?,
         DeregisterStep::RemoveAccountSection { account, config_path } => remove_account_section_from_file(config_path, account)?,
         DeregisterStep::DeleteDatabaseFile { db_path } => std::fs::remove_file(db_path)?,
+        DeregisterStep::DeleteBrowserLockFile { lock_path } => std::fs::remove_file(lock_path)?,
         DeregisterStep::DeleteProfileDirectory { profile_dir } => std::fs::remove_dir_all(profile_dir)?,
         DeregisterStep::DeleteDirectoryIfEmpty { directory } => return delete_directory_if_empty(directory),
     }
@@ -622,9 +664,14 @@ mod tests {
   handle = weeklybot
 ";
 
-    fn get_observed_section(db_path: Option<&str>, profile_dir: Option<&str>) -> ObservedAccountSection {
+    fn get_observed_section(
+        db_path: Option<&str>,
+        browser_lock_path: Option<&str>,
+        profile_dir: Option<&str>,
+    ) -> ObservedAccountSection {
         ObservedAccountSection {
             existing_db_path: db_path.map(PathBuf::from),
+            existing_browser_lock_path: browser_lock_path.map(PathBuf::from),
             existing_profile_dir: profile_dir.map(PathBuf::from),
         }
     }
@@ -635,10 +682,11 @@ mod tests {
 
     fn get_observed_account_with_data() -> ObservedAccount {
         ObservedAccount {
-            installed_plist_path: None,
+            installed_scheduled_jobs: Vec::new(),
             secrets_store: None,
             account_section: Some(get_observed_section(
                 Some("/tmp/xost/gimmick/queue.db"),
+                Some("/tmp/xost/gimmick/browser.lock"),
                 Some("/tmp/xost/gimmick/chrome-profile"),
             )),
             other_account_data_paths: Vec::new(),
@@ -756,12 +804,12 @@ mod tests {
     #[test]
     fn build_plan_lists_only_what_exists() {
         let observed_account: ObservedAccount = ObservedAccount {
-            installed_plist_path: None,
+            installed_scheduled_jobs: Vec::new(),
             secrets_store: Some(ObservedSecretsStore {
                 store_path: PathBuf::from("/tmp/secrets.yaml"),
                 stored_secret_names: vec!["daily_password".to_string(), "gimmick_password".to_string()],
             }),
-            account_section: Some(get_observed_section(Some("/tmp/gimmick/queue.db"), None)),
+            account_section: Some(get_observed_section(Some("/tmp/gimmick/queue.db"), None, None)),
             other_account_data_paths: Vec::new(),
         };
 
@@ -790,6 +838,10 @@ mod tests {
                 reason: KeptReason::DeleteDataNotRequested,
             },
             KeptDataPath {
+                path: PathBuf::from("/tmp/xost/gimmick/browser.lock"),
+                reason: KeptReason::DeleteDataNotRequested,
+            },
+            KeptDataPath {
                 path: PathBuf::from("/tmp/xost/gimmick/chrome-profile"),
                 reason: KeptReason::DeleteDataNotRequested,
             },
@@ -801,9 +853,12 @@ mod tests {
     fn build_plan_deletes_the_data_and_then_its_shared_parent_directory_with_delete_data() {
         let plan: DeregisterPlan = get_plan(get_observed_account_with_data(), DataHandling::Delete);
 
-        let expected_data_steps: [DeregisterStep; 3] = [
+        let expected_data_steps: [DeregisterStep; 4] = [
             DeregisterStep::DeleteDatabaseFile {
                 db_path: PathBuf::from("/tmp/xost/gimmick/queue.db"),
+            },
+            DeregisterStep::DeleteBrowserLockFile {
+                lock_path: PathBuf::from("/tmp/xost/gimmick/browser.lock"),
             },
             DeregisterStep::DeleteProfileDirectory {
                 profile_dir: PathBuf::from("/tmp/xost/gimmick/chrome-profile"),
@@ -818,7 +873,10 @@ mod tests {
     #[test]
     fn build_plan_removes_the_scheduled_job_when_its_plist_exists() {
         let observed_account: ObservedAccount = ObservedAccount {
-            installed_plist_path: Some("/Library/LaunchDaemons/xost.gimmick.plist".to_string()),
+            installed_scheduled_jobs: vec![InstalledScheduledJob {
+                label: "ro.zach.xost.gimmick".to_string(),
+                installed_plist_path: "/Library/LaunchDaemons/ro.zach.xost.gimmick.plist".to_string(),
+            }],
             secrets_store: None,
             account_section: None,
             other_account_data_paths: Vec::new(),
@@ -826,20 +884,21 @@ mod tests {
 
         let plan: DeregisterPlan = get_plan(observed_account, DataHandling::Keep);
 
-        let expected_steps: Vec<DeregisterStep> = vec![DeregisterStep::RemoveScheduledJob {
-            account: "gimmick".to_string(),
-            installed_plist_path: "/Library/LaunchDaemons/xost.gimmick.plist".to_string(),
-        }];
+        let expected_steps: Vec<DeregisterStep> = vec![DeregisterStep::RemoveScheduledJob(InstalledScheduledJob {
+            label: "ro.zach.xost.gimmick".to_string(),
+            installed_plist_path: "/Library/LaunchDaemons/ro.zach.xost.gimmick.plist".to_string(),
+        })];
         assert_eq!(plan.steps, expected_steps);
     }
 
     #[test]
     fn build_plan_skips_a_parent_directory_inside_the_deleted_profile_directory() {
         let observed_account: ObservedAccount = ObservedAccount {
-            installed_plist_path: None,
+            installed_scheduled_jobs: Vec::new(),
             secrets_store: None,
             account_section: Some(get_observed_section(
                 Some("/tmp/xost/gimmick/chrome-profile/queue.db"),
+                None,
                 Some("/tmp/xost/gimmick/chrome-profile"),
             )),
             other_account_data_paths: Vec::new(),
@@ -868,9 +927,14 @@ mod tests {
 
         let plan: DeregisterPlan = get_plan(observed_account, DataHandling::Delete);
 
-        let expected_data_steps: [DeregisterStep; 1] = [DeregisterStep::DeleteDatabaseFile {
-            db_path: PathBuf::from("/tmp/xost/gimmick/queue.db"),
-        }];
+        let expected_data_steps: [DeregisterStep; 2] = [
+            DeregisterStep::DeleteDatabaseFile {
+                db_path: PathBuf::from("/tmp/xost/gimmick/queue.db"),
+            },
+            DeregisterStep::DeleteBrowserLockFile {
+                lock_path: PathBuf::from("/tmp/xost/gimmick/browser.lock"),
+            },
+        ];
         let expected_kept_data_paths: Vec<KeptDataPath> = vec![
             KeptDataPath {
                 path: PathBuf::from("/tmp/xost/gimmick/chrome-profile"),
@@ -886,9 +950,20 @@ mod tests {
     }
 
     #[test]
+    fn get_configured_data_paths_includes_the_browser_lock_beside_the_queue_db() {
+        let sections: Vec<Section> = config::parse(CONFIG_WITH_THREE_ACCOUNTS).unwrap();
+        let daily_values: &BTreeMap<String, String> =
+            config::find_section(&sections, config::ACCOUNT_SECTION, Some("daily")).unwrap();
+
+        let data_paths: Vec<PathBuf> = get_configured_data_paths(daily_values);
+
+        assert_eq!(data_paths, vec![PathBuf::from("/tmp/daily/queue.db"), PathBuf::from("/tmp/daily/browser.lock")]);
+    }
+
+    #[test]
     fn build_plan_is_empty_when_nothing_of_the_account_exists() {
         let observed_account: ObservedAccount = ObservedAccount {
-            installed_plist_path: None,
+            installed_scheduled_jobs: Vec::new(),
             secrets_store: Some(ObservedSecretsStore {
                 store_path: PathBuf::from("/tmp/secrets.yaml"),
                 stored_secret_names: vec!["daily_password".to_string()],

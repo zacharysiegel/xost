@@ -7,15 +7,16 @@ Each account is a `[account "<name>"]` section in `~/.config/xost/config`, selec
 ## Commands
 
 - `xost register <name>` — create the account's config section, its secrets and its data directory by answering prompts. See Setup.
-- `xost deregister <name> [--delete-data]` — after a `[y/N]` confirmation, remove the account's LaunchDaemon (via `sudo`), its secrets and its config section; `--delete-data` also deletes its queue db, Chrome profile and, if then empty, their directory, keeping any of these that another account's `db` or `profile` path equals, contains or lies inside.
-- `xost [--account <name>] status [--check-login]` — read-only report on every account unless `--account` is given: config validity, schedule, next run, LaunchDaemon plist and load state, queue counts, next, stuck and failed records, and session cookie expiry; `--check-login` also opens each account headless to check X shows it logged in.
+- `xost deregister <name> [--delete-data]` — after a `[y/N]` confirmation, remove the account's LaunchDaemons (via `sudo`), its secrets and its config section; `--delete-data` also deletes its queue db, browser lock file, Chrome profile and, if then empty, their directory, keeping any of these that another account's `db` or `profile` path equals, contains or lies inside.
+- `xost [--account <name>] status [--check-login]` — read-only report on every account unless `--account` is given: config validity, the posting and check jobs' schedule, next run, plist and load state, queue counts, next, stuck and failed records, and session cookie expiry; `--check-login` also opens each account headless to check X shows it logged in.
+- `xost [--account <name>] check` — for every account unless `--account` is given, check for conditions that need attention, send an alert for each new one (see Alerts under Behavior) and print a one-line summary per account. Opens each account headless like `status --check-login`. Exits non-zero only when the config cannot be read or `--account` names an absent account.
 - `xost --account <name> post` — post the next queued tweet. Headless. The scheduled daily run.
 - `xost --account <name> login` — open your normal Chrome (not an automated session) on the account's profile to sign in by hand and refresh the session.
 - `xost --account <name> enqueue [--heading "<text>"] --body "<text>" [--source-url <url>] [--order <n>]` — add a tweet. Order defaults to the end. A heading is posted before the body, joined by the account's `heading_separator` (default one space). `--source-url` is the record's link for the overflow post or the source post (see Threads under Behavior).
 - `xost --account <name> diagnose` — open the account headless, report whether the session is valid, and save a screenshot to `/tmp/xost-diag.png`. Use it to check login state (e.g. after the yearly re-login).
 - `xost --account <name> export-session` — print the account's X session cookies as JSON (run on a machine that's logged in). Transfers a session to a server without logging in there.
 - `xost --account <name> import-session --from <file>` — load session cookies from a JSON file into this profile and confirm it's logged in.
-- `xost --account <name> schedule [--remove | --print]` — install (or replace) a LaunchDaemon that runs `post` on the account's `schedule` cron expression. `--remove` unloads and deletes it; `--print` prints the plist without installing anything. Installing and removing run `sudo`. See Schedule under Setup.
+- `xost --account <name> schedule [--remove | --print]` — install (or replace) a LaunchDaemon that runs `post` on the account's `schedule` cron expression and, when `check_schedule` is set, a second one that runs `check` on it; an installed check job is removed when `check_schedule` is unset. `--remove` unloads and deletes both; `--print` prints both plists without installing anything. Installing and removing run `sudo`. See Schedule under Setup.
 
 `--account` defaults to `default` for the other commands. `--config <path>` overrides the config location (default `~/.config/xost/config`).
 
@@ -60,7 +61,16 @@ Per-account files live under `~/.local/share/xost/<name>/`. Nothing sensitive go
 
        ./target/release/xost --account default schedule
 
-   This installs `/Library/LaunchDaemons/ro.zach.xost.<account>.plist` and loads it. The job runs as your user without anyone logged in, and a post missed while the machine slept runs on wake. It runs the binary and config at the paths `schedule` was invoked with, so rerun `schedule` after moving either or after changing the `schedule` key. One job per account. The scheduled job writes its output and failures to `~/Library/Logs/xost-<account>.log`.
+   This installs `/Library/LaunchDaemons/ro.zach.xost.<account>.plist` and loads it. The job runs as your user without anyone logged in, and a post missed while the machine slept runs on wake. It runs the binary and config at the paths `schedule` was invoked with, so rerun `schedule` after moving either or after changing the `schedule` or `check_schedule` key. The job writes its output and failures to `~/Library/Logs/xost-<account>.log`.
+
+   An optional `check_schedule` key (same cron rules, e.g. `check_schedule = 30 8 * * *`) adds the job `ro.zach.xost.<account>.check`, which runs `check` and logs to `~/Library/Logs/xost-<account>.check.log`. Give it a time apart from `schedule`: both jobs take the account's browser lock (see Behavior).
+
+6. Alerts. Install [simple-alert](https://github.com/zacharysiegel/simple-alert) and register the service `xost`:
+
+       cargo install --git https://github.com/zacharysiegel/simple-alert
+       simple-alert register xost
+
+   xost reads `~/.config/simple-alert/config.toml` of the user it runs as.
 
 ## Running on a server (no desktop for manual login)
 
@@ -86,11 +96,17 @@ These are an anti-detection arms race: they work now, and X can change its check
 
 ## Behavior
 
+- Browser lock: every command that opens the account's Chrome profile first takes an exclusive lock on `browser.lock` beside its queue db, held until its browser closes; `post` waits up to 10 minutes per attempt and then counts an environment failure, `check` and `status --check-login` skip the login check, and the others exit with an error. A Chrome `SingletonLock` naming this machine and a process no longer running is ignored as stale.
 - Already-posted-today: before posting, the tool reads the account's latest post time and skips if a post already exists today (UTC). Covers posts you make by hand.
 - Crash safety (at-most-once): a row is locked before the publish click and unlocked on confirmation. A run that finds a row still locked from a previous run does not retry it; it reports this so you can confirm on X whether it posted. A failure after the publish click is never retried.
 - Threads: text weighing more than `thread_post_limit` (default 280, counted the way X counts) is posted as one thread, split at spaces and line breaks, never inside a word. Each post ends with its position `k/n` on its own line (`thread_numbering = all_posts`, the default) or only the first does (`first_post`). Beyond `thread_max_posts` posts (default 9) the thread stops where that post's split falls and adds an unnumbered overflow post `<thread_overflow_label>: <source url>`. A record that needs that post fails unless both the record's source URL and the account's `thread_overflow_label` are set. A record that fits within `thread_max_posts`, including one that fits in a single post, instead ends with an unnumbered source post `<thread_source_label>: <source url>` when both are set, and with nothing extra otherwise.
 - Failed records: a failure before the publish click is retried immediately in a fresh browser session, up to 3 attempts per run. A failure before X's composer is ready (browser launch, compose page, first editor) is an environment failure: it leaves the record untouched, and if the last attempt fails this way the run reports it and the next run retries the same record. A later failure counts against the record. A record whose last attempt fails that way, or which cannot be split into a thread, gets `failed_at` set and is skipped on future runs; the run ends without posting another record. A sign-in failure does not mark the record failed. Requeue a failed record with `update tweet_queue set failed_at = null where id = <id>;`.
-- Failures are written to stderr and sent as a macOS notification tagged with the account name; the notification appears only for a command run from a desktop session.
+- Alerts: sent through simple-alert as service `xost`, with a message beginning with the account name. If sending fails (no simple-alert config, `xost` not registered, network), the failure and the message are written to stderr and the command continues unchanged.
+    - `post` and `check`: a config file that cannot be read or parsed sends an error naming the `--account` account, or every account without `--account`.
+    - `post`: a stuck, failed or unconfirmed record and a sign-in failure send an error; an environment failure on the last attempt sends a warning. The failure is also written to stderr.
+    - `check`, each an error unless noted: the config section fails to load; no session cookie; the session cookie expires within 14 or 7 days (warning) or 3 or 1 days; X shows the account logged out while its cookie has not expired; the account has a `schedule` key but its posting job is not installed or not loaded.
+    - `check` deduplication: a condition alerts when it appears and again only after it has cleared and reappeared. A cookie expiry alerts once per threshold, for the nearest threshold crossed; a later expiry (after `login`) starts over. Sent alerts are recorded in the `alert_state` table of the account's queue db; an alert that fails to send is retried on the next run.
+    - `check` skips the login check, without alerting, when the Chrome profile is in use or Chrome fails to launch, and says so in its summary.
 
 ## 2FA
 
