@@ -200,14 +200,14 @@ fn observe_other_account_data_paths(account: &str, sections: &[Section]) -> Vec<
         }
 
         for key in [config::DB_KEY, config::PROFILE_KEY] {
-            let Some(raw_path) = account_section.values.get(key).filter(|raw_path| !raw_path.is_empty())
+            let Some(data_path) = config::get_configured_path(account_section.values, key)
             else {
                 continue;
             };
 
             other_account_data_paths.push(OtherAccountDataPath {
                 account: account_section.name.to_string(),
-                data_path: config::expand_user_path(raw_path),
+                data_path,
             });
         }
     }
@@ -216,15 +216,13 @@ fn observe_other_account_data_paths(account: &str, sections: &[Section]) -> Vec<
 }
 
 fn observe_secrets_store(sections: &[Section]) -> Result<Option<ObservedSecretsStore>, AppError> {
-    let configured_store: Option<&String> = config::find_section(sections, config::SECRETS_SECTION, None)
-        .and_then(|secrets_values| secrets_values.get(config::SECRETS_STORE_KEY))
-        .filter(|store| !store.is_empty());
+    let configured_store_path: Option<PathBuf> = config::find_section(sections, config::SECRETS_SECTION, None)
+        .and_then(|secrets_values| config::get_configured_path(secrets_values, config::SECRETS_STORE_KEY));
 
-    let Some(store) = configured_store else {
+    let Some(store_path) = configured_store_path else {
         return Ok(None);
     };
 
-    let store_path: PathBuf = config::expand_user_path(store);
     let stored_secret_names: Vec<String> = secrets::read_stored_secret_names(&store_path)?;
 
     Ok(Some(ObservedSecretsStore {
@@ -241,8 +239,7 @@ fn observe_account_section(account_values: &BTreeMap<String, String>) -> Observe
 }
 
 fn get_existing_configured_path(values: &BTreeMap<String, String>, key: &str) -> Option<PathBuf> {
-    let raw: &String = values.get(key).filter(|raw| !raw.is_empty())?;
-    let path: PathBuf = config::expand_user_path(raw);
+    let path: PathBuf = config::get_configured_path(values, key)?;
     let path_exists: bool = path.exists();
 
     path_exists.then_some(path)

@@ -6,5 +6,4 @@ minimer::impl_from_error!(AppError, serde_json::Error);
 minimer::impl_from_error!(AppError, secr::error::Error);
 minimer::impl_from_error!(AppError, totp_rs::SecretParseError);
 minimer::impl_from_error!(AppError, totp_rs::TotpError);
-minimer::impl_from_error!(AppError, time::error::Parse);
-minimer::impl_from_error!(AppError, time::error::Format);
+minimer::impl_from_error!(AppError, jiff::Error);

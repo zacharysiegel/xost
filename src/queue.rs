@@ -8,12 +8,62 @@ use crate::clock;
 use crate::error::AppError;
 
 const COLUMNS: &str = "id, heading, body, source_url";
+const TWEET_QUEUE_COLUMNS: [TweetQueueColumn; 12] = [
+    TweetQueueColumn::created_with_table("id", "integer primary key autoincrement"),
+    TweetQueueColumn::added_when_missing("heading", "text"),
+    TweetQueueColumn::created_with_table("body", "text not null"),
+    TweetQueueColumn::created_with_table("queue_order", "integer not null"),
+    TweetQueueColumn::created_with_table("enabled", "integer not null default 1"),
+    TweetQueueColumn::created_with_table("last_posted_at", "text"),
+    TweetQueueColumn::created_with_table("posting_started_at", "text"),
+    TweetQueueColumn::created_with_table("attempts", "integer not null default 0"),
+    TweetQueueColumn::created_with_table("last_error", "text"),
+    TweetQueueColumn::created_with_table("created_at", "text not null default (strftime('%Y-%m-%dT%H:%M:%SZ','now'))"),
+    TweetQueueColumn::added_when_missing("source_url", "text"),
+    TweetQueueColumn::added_when_missing("failed_at", "text"),
+];
 
 pub struct QueuedTweet {
     pub id: i64,
     pub heading: Option<String>,
     pub body: String,
     pub source_url: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct StuckRecord {
+    pub id: i64,
+    pub heading: Option<String>,
+    pub posting_started_at: String,
+}
+
+enum ColumnMigration {
+    CreatedWithTable,
+    AddedWhenMissing,
+}
+
+struct TweetQueueColumn {
+    name: &'static str,
+    definition: &'static str,
+    migration: ColumnMigration,
+}
+
+impl TweetQueueColumn {
+    const fn created_with_table(name: &'static str, definition: &'static str) -> TweetQueueColumn {
+        TweetQueueColumn {
+            name,
+            definition,
+            migration: ColumnMigration::CreatedWithTable,
+        }
+    }
+
+    const fn added_when_missing(name: &'static str, definition: &'static str) -> TweetQueueColumn {
+        TweetQueueColumn {
+            name,
+            definition,
+            migration: ColumnMigration::AddedWhenMissing,
+        }
+    }
 }
 
 pub fn open(path: &Path) -> Result<Connection, AppError> {
@@ -29,36 +79,28 @@ pub fn open(path: &Path) -> Result<Connection, AppError> {
 }
 
 pub fn init_schema(connection: &Connection) -> Result<(), AppError> {
-    connection.execute_batch(
-        "create table if not exists tweet_queue (
-            id                 integer primary key autoincrement,
-            heading            text,
-            body               text    not null,
-            queue_order        integer not null,
-            enabled            integer not null default 1,
-            last_posted_at     text,
-            posting_started_at text,
-            attempts           integer not null default 0,
-            last_error         text,
-            created_at         text    not null default (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            source_url         text,
-            failed_at          text
-        );",
-    )?;
+    let column_definitions: Vec<String> = TWEET_QUEUE_COLUMNS
+        .iter()
+        .map(|column| format!("{} {}", column.name, column.definition))
+        .collect();
 
-    add_text_column_if_missing(connection, "heading")?;
+    connection.execute_batch(&format!("create table if not exists tweet_queue ({});", column_definitions.join(", ")))?;
+
     rename_overflow_url_to_source_url_if_present(connection)?;
-    add_text_column_if_missing(connection, "source_url")?;
-    add_text_column_if_missing(connection, "failed_at")?;
+    add_missing_columns(connection)?;
 
     Ok(())
 }
 
-fn add_text_column_if_missing(connection: &Connection, column_name: &str) -> Result<(), AppError> {
-    let column_present: bool = column_exists(connection, column_name)?;
+fn add_missing_columns(connection: &Connection) -> Result<(), AppError> {
+    let missing_column_names: Vec<String> = read_missing_columns(connection)?;
 
-    if !column_present {
-        connection.execute_batch(&format!("alter table tweet_queue add column {} text;", column_name))?;
+    for column in &TWEET_QUEUE_COLUMNS {
+        let column_missing: bool = missing_column_names.iter().any(|missing_column_name| missing_column_name == column.name);
+
+        if column_missing && matches!(column.migration, ColumnMigration::AddedWhenMissing) {
+            connection.execute_batch(&format!("alter table tweet_queue add column {} {};", column.name, column.definition))?;
+        }
     }
 
     Ok(())
@@ -75,6 +117,20 @@ fn rename_overflow_url_to_source_url_if_present(connection: &Connection) -> Resu
     Ok(())
 }
 
+pub fn read_missing_columns(connection: &Connection) -> Result<Vec<String>, AppError> {
+    let mut missing_column_names: Vec<String> = Vec::new();
+
+    for column in &TWEET_QUEUE_COLUMNS {
+        let column_present: bool = column_exists(connection, column.name)?;
+
+        if !column_present {
+            missing_column_names.push(column.name.to_string());
+        }
+    }
+
+    Ok(missing_column_names)
+}
+
 fn column_exists(connection: &Connection, column_name: &str) -> Result<bool, AppError> {
     let column_count: i64 = connection.query_row(
         "select count(*) from pragma_table_info('tweet_queue') where name = ?1",
@@ -85,16 +141,28 @@ fn column_exists(connection: &Connection, column_name: &str) -> Result<bool, App
     Ok(column_count > 0)
 }
 
-pub fn find_stuck(connection: &Connection) -> Result<Option<QueuedTweet>, AppError> {
-    let query: String = format!(
-        "select {COLUMNS} from tweet_queue where posting_started_at is not null order by id asc limit 1"
-    );
+pub fn read_stuck_records(connection: &Connection) -> Result<Vec<StuckRecord>, AppError> {
+    let mut statement: rusqlite::Statement<'_> = connection.prepare(
+        "select id, heading, posting_started_at from tweet_queue where posting_started_at is not null order by id asc",
+    )?;
 
-    let stuck_tweet: Option<QueuedTweet> = connection
-        .query_row(&query, [], map_row)
-        .optional()?;
+    let stuck_records: Vec<StuckRecord> = statement
+        .query_map([], |record| {
+            Ok(StuckRecord {
+                id: record.get(0)?,
+                heading: record.get(1)?,
+                posting_started_at: record.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<StuckRecord>>>()?;
 
-    Ok(stuck_tweet)
+    Ok(stuck_records)
+}
+
+pub fn find_stuck(connection: &Connection) -> Result<Option<StuckRecord>, AppError> {
+    let stuck_records: Vec<StuckRecord> = read_stuck_records(connection)?;
+
+    Ok(stuck_records.into_iter().next())
 }
 
 pub fn select_next(connection: &Connection) -> Result<Option<QueuedTweet>, AppError> {
@@ -113,7 +181,7 @@ pub fn select_next(connection: &Connection) -> Result<Option<QueuedTweet>, AppEr
 }
 
 pub fn mark_posting(connection: &Connection, id: i64) -> Result<(), AppError> {
-    let now: String = clock::now_rfc3339()?;
+    let now: String = clock::now_rfc3339();
 
     connection.execute(
         "update tweet_queue set posting_started_at = ?1 where id = ?2",
@@ -124,7 +192,7 @@ pub fn mark_posting(connection: &Connection, id: i64) -> Result<(), AppError> {
 }
 
 pub fn mark_posted(connection: &Connection, id: i64) -> Result<(), AppError> {
-    let now: String = clock::now_rfc3339()?;
+    let now: String = clock::now_rfc3339();
 
     connection.execute(
         "update tweet_queue
@@ -154,7 +222,7 @@ pub fn record_failed_attempt(connection: &Connection, id: i64, error_message: &s
 }
 
 pub fn mark_failed(connection: &Connection, id: i64, error_message: &str) -> Result<(), AppError> {
-    let now: String = clock::now_rfc3339()?;
+    let now: String = clock::now_rfc3339();
 
     connection.execute(
         "update tweet_queue
@@ -369,6 +437,36 @@ mod tests {
         mark_posting(&connection, id).unwrap();
 
         assert_eq!(find_stuck(&connection).unwrap().unwrap().id, id);
+    }
+
+    #[test]
+    fn read_stuck_records_returns_every_locked_record_with_its_lock_time() {
+        let connection: Connection = create_fresh_db();
+        let first_stuck_id: i64 = enqueue(&connection, Some("1."), "a", None, None).unwrap();
+        enqueue(&connection, None, "b", None, None).unwrap();
+        let second_stuck_id: i64 = enqueue(&connection, None, "c", None, None).unwrap();
+        connection
+            .execute(
+                "update tweet_queue set posting_started_at = '2026-11-15T09:00:00Z' where id in (?1, ?2)",
+                params![first_stuck_id, second_stuck_id],
+            )
+            .unwrap();
+
+        let stuck_records: Vec<StuckRecord> = read_stuck_records(&connection).unwrap();
+
+        let expected_stuck_records: Vec<StuckRecord> = vec![
+            StuckRecord {
+                id: first_stuck_id,
+                heading: Some("1.".to_string()),
+                posting_started_at: "2026-11-15T09:00:00Z".to_string(),
+            },
+            StuckRecord {
+                id: second_stuck_id,
+                heading: None,
+                posting_started_at: "2026-11-15T09:00:00Z".to_string(),
+            },
+        ];
+        assert_eq!(stuck_records, expected_stuck_records);
     }
 
     #[test]

@@ -50,9 +50,7 @@ impl Config {
     pub fn load(config_path: &std::path::Path, account: &str) -> Result<Self, AppError> {
         validate_account_name(account)?;
 
-        let contents: String = std::fs::read_to_string(config_path).map_err(|error| {
-            AppError::new(&format!("could not read config at {}: {}", config_path.display(), error))
-        })?;
+        let contents: String = read_required_config(config_path)?;
 
         let sections: Vec<Section> = parse(&contents)?;
 
@@ -75,10 +73,10 @@ impl Config {
 
         let handle: String = require(account_values, HANDLE_KEY, account)?;
         let username: String = account_values.get(USERNAME_KEY).cloned().unwrap_or_else(|| handle.clone());
-        let db_path: PathBuf = expand_user_path(&require(account_values, DB_KEY, account)?);
-        let profile_dir: PathBuf = expand_user_path(&require(account_values, PROFILE_KEY, account)?);
-        let chrome_path: Option<PathBuf> = account_values.get(CHROME_KEY).map(|raw| expand_user_path(raw));
-        let secr_store_path: PathBuf = expand_user_path(&require(secrets_values, SECRETS_STORE_KEY, SECRETS_SECTION)?);
+        let db_path: PathBuf = require_path(account_values, DB_KEY, account)?;
+        let profile_dir: PathBuf = require_path(account_values, PROFILE_KEY, account)?;
+        let chrome_path: Option<PathBuf> = get_configured_path(account_values, CHROME_KEY);
+        let secr_store_path: PathBuf = require_path(secrets_values, SECRETS_STORE_KEY, SECRETS_SECTION)?;
         let secr_key_base64: String = require(secrets_values, SECRETS_KEY_KEY, SECRETS_SECTION)?;
         let heading_separator: String = match account_values.get(HEADING_SEPARATOR_KEY) {
             Some(raw) => parse_string_value(raw)?,
@@ -228,9 +226,16 @@ pub fn default_config_path() -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(home).join(".config").join("xost").join("config"))
 }
 
+pub fn read_required_config(config_path: &std::path::Path) -> Result<String, AppError> {
+    std::fs::read_to_string(config_path).map_err(|error| get_config_read_error(config_path, &error))
+}
+
 pub fn read_existing_config(config_path: &std::path::Path) -> Result<String, AppError> {
-    private_file::read_existing_text(config_path)
-        .map_err(|error| AppError::new(&format!("could not read config at {}: {}", config_path.display(), error)))
+    private_file::read_existing_text(config_path).map_err(|error| get_config_read_error(config_path, &error))
+}
+
+fn get_config_read_error(config_path: &std::path::Path, error: &impl std::fmt::Display) -> AppError {
+    AppError::new(&format!("could not read config at {}: {}", config_path.display(), error))
 }
 
 pub fn secrets_section_header() -> String {
@@ -341,7 +346,7 @@ pub fn find_named_sections<'a>(sections: &'a [Section], kind: &str) -> Vec<Named
         .collect()
 }
 
-fn account_names(sections: &[Section]) -> String {
+pub fn account_names(sections: &[Section]) -> String {
     let names: Vec<&str> = find_named_sections(sections, ACCOUNT_SECTION)
         .into_iter()
         .map(|account_section| account_section.name)
@@ -359,7 +364,19 @@ pub fn require(values: &BTreeMap<String, String>, key: &str, context: &str) -> R
         .get(key)
         .filter(|value| !value.is_empty())
         .cloned()
-        .ok_or_else(|| AppError::new(&format!("config section '{}' is missing required key '{}'", context, key)))
+        .ok_or_else(|| get_missing_key_error(key, context))
+}
+
+fn require_path(values: &BTreeMap<String, String>, key: &str, context: &str) -> Result<PathBuf, AppError> {
+    get_configured_path(values, key).ok_or_else(|| get_missing_key_error(key, context))
+}
+
+fn get_missing_key_error(key: &str, context: &str) -> AppError {
+    AppError::new(&format!("config section '{}' is missing required key '{}'", context, key))
+}
+
+pub fn get_configured_path(values: &BTreeMap<String, String>, key: &str) -> Option<PathBuf> {
+    values.get(key).filter(|raw| !raw.is_empty()).map(|raw| expand_user_path(raw))
 }
 
 pub fn validate_account_name(account: &str) -> Result<(), AppError> {

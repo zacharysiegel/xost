@@ -1,5 +1,10 @@
 use std::collections::BTreeSet;
 
+use jiff::Timestamp;
+use jiff::ZonedDateTime;
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
+
 use crate::error::AppError;
 
 const MINUTE: FieldSpecification = FieldSpecification {
@@ -29,6 +34,8 @@ const DAY_OF_WEEK: FieldSpecification = FieldSpecification {
 };
 const SUNDAY: u8 = 0;
 const SUNDAY_ALTERNATE: u8 = 7;
+const SECONDS_PER_MINUTE: i64 = 60;
+const NEXT_RUN_SEARCH_HORIZON_MINUTES: i64 = 366 * 24 * 60;
 
 #[derive(Debug, PartialEq)]
 pub enum CronField {
@@ -45,6 +52,27 @@ impl CronField {
             CronField::OnlyFromWildcard(values) | CronField::Only(values) => Some(values),
         }
     }
+
+    fn matches(&self, value: i8) -> bool {
+        let Some(values) = self.restricted_values() else {
+            return true;
+        };
+
+        u8::try_from(value).is_ok_and(|value| values.contains(&value))
+    }
+}
+
+pub enum DayRestriction {
+    EveryDay,
+    DayOfMonthOnly,
+    DayOfWeekOnly,
+    EitherDayField,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum NextRun {
+    At(ZonedDateTime),
+    NoneWithinHorizon,
 }
 
 #[derive(Debug, PartialEq)]
@@ -78,16 +106,89 @@ impl CronSchedule {
             )));
         };
 
-        let day_of_week_with_sunday_as_0: CronField = normalize_sunday(parse_field(day_of_week, &DAY_OF_WEEK)?);
-
-        Ok(CronSchedule {
+        let schedule: CronSchedule = CronSchedule {
             minute: parse_field(minute, &MINUTE)?,
             hour: parse_field(hour, &HOUR)?,
             day_of_month: parse_field(day_of_month, &DAY_OF_MONTH)?,
             month: parse_field(month, &MONTH)?,
-            day_of_week: day_of_week_with_sunday_as_0,
-        })
+            day_of_week: normalize_sunday(parse_field(day_of_week, &DAY_OF_WEEK)?),
+        };
+
+        validate_day_fields_expressible_in_launchd(&schedule, expression)?;
+
+        Ok(schedule)
     }
+
+    pub fn day_restriction(&self) -> DayRestriction {
+        match (self.day_of_month.restricted_values(), self.day_of_week.restricted_values()) {
+            (None, None) => DayRestriction::EveryDay,
+            (Some(_), None) => DayRestriction::DayOfMonthOnly,
+            (None, Some(_)) => DayRestriction::DayOfWeekOnly,
+            (Some(_), Some(_)) => DayRestriction::EitherDayField,
+        }
+    }
+
+    pub fn matches(&self, local_time: DateTime) -> bool {
+        self.minute.matches(local_time.minute())
+            && self.hour.matches(local_time.hour())
+            && self.month.matches(local_time.month())
+            && self.matches_day(local_time)
+    }
+
+    fn matches_day(&self, local_time: DateTime) -> bool {
+        let day_of_month_matches: bool = self.day_of_month.matches(local_time.day());
+        let day_of_week_matches: bool = self.day_of_week.matches(local_time.weekday().to_sunday_zero_offset());
+
+        match self.day_restriction() {
+            DayRestriction::EveryDay => true,
+            DayRestriction::DayOfMonthOnly => day_of_month_matches,
+            DayRestriction::DayOfWeekOnly => day_of_week_matches,
+            DayRestriction::EitherDayField => day_of_month_matches || day_of_week_matches,
+        }
+    }
+}
+
+/* launchd fires a calendar interval whose Day and Weekday are both set when either matches. Vixie cron instead
+requires both day fields to match when either field's text begins with '*' and both are restricted. */
+fn validate_day_fields_expressible_in_launchd(schedule: &CronSchedule, expression: &str) -> Result<(), AppError> {
+    let day_fields_both_restricted: bool = matches!(schedule.day_restriction(), DayRestriction::EitherDayField);
+    let day_field_begins_with_wildcard: bool = matches!(schedule.day_of_month, CronField::OnlyFromWildcard(_))
+        || matches!(schedule.day_of_week, CronField::OnlyFromWildcard(_));
+
+    if day_fields_both_restricted && day_field_begins_with_wildcard {
+        return Err(AppError::new(&format!(
+            "schedule '{}' restricts both day-of-month and day-of-week with one of them beginning with '*', \
+             which cron runs only on days matching both fields; launchd runs a job on days matching either field, \
+             so it cannot run every Nth day only when it is also a given weekday. \
+             Restrict one day field, or write both without '*' to run on days matching either",
+            expression,
+        )));
+    }
+
+    Ok(())
+}
+
+/// The first minute strictly after `after` whose wall-clock reading in `after`'s time zone matches the schedule.
+pub fn get_next_run_after(schedule: &CronSchedule, after: &ZonedDateTime) -> NextRun {
+    let time_zone: &TimeZone = after.time_zone();
+    let after_minute_start_second: i64 = after.timestamp().as_second().div_euclid(SECONDS_PER_MINUTE) * SECONDS_PER_MINUTE;
+
+    for minute_offset in 1..=NEXT_RUN_SEARCH_HORIZON_MINUTES {
+        let candidate_lookup: Result<Timestamp, jiff::Error> =
+            Timestamp::from_second(after_minute_start_second + minute_offset * SECONDS_PER_MINUTE);
+
+        let Ok(candidate) = candidate_lookup else {
+            return NextRun::NoneWithinHorizon;
+        };
+
+        let candidate_local_time: DateTime = time_zone.to_datetime(candidate);
+
+        if schedule.matches(candidate_local_time) {
+            return NextRun::At(candidate.to_zoned_datetime(time_zone.clone()));
+        }
+    }
+
+    NextRun::NoneWithinHorizon
 }
 
 struct FieldSpecification {
@@ -223,9 +324,63 @@ fn with_sunday_as_0(mut values: BTreeSet<u8>) -> BTreeSet<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock;
 
     fn get_field_matching_only(values: &[u8]) -> CronField {
         CronField::Only(values.iter().copied().collect())
+    }
+
+    fn get_next_run_for(expression: &str, after_rfc3339: &str) -> NextRun {
+        get_next_run_after(&CronSchedule::parse(expression).unwrap(), &clock::get_utc_time(after_rfc3339))
+    }
+
+    #[test]
+    fn get_next_run_after_is_later_today_for_a_daily_time_not_yet_reached() {
+        let next_run: NextRun = get_next_run_for("0 9 * * *", "2026-11-15T08:30:00Z");
+
+        assert_eq!(next_run, NextRun::At(clock::get_utc_time("2026-11-15T09:00:00Z")));
+    }
+
+    #[test]
+    fn get_next_run_after_is_tomorrow_for_a_daily_time_reached_this_minute() {
+        let next_run: NextRun = get_next_run_for("0 9 * * *", "2026-11-15T09:00:00Z");
+
+        assert_eq!(next_run, NextRun::At(clock::get_utc_time("2026-11-16T09:00:00Z")));
+    }
+
+    #[test]
+    fn get_next_run_after_waits_for_the_restricted_day_of_week() {
+        let next_run: NextRun = get_next_run_for("0 9 * * 3", "2026-11-15T10:00:00Z");
+
+        assert_eq!(next_run, NextRun::At(clock::get_utc_time("2026-11-18T09:00:00Z")));
+    }
+
+    #[test]
+    fn get_next_run_after_crosses_a_month_boundary() {
+        let next_run: NextRun = get_next_run_for("0 0 1 * *", "2026-11-30T12:00:00Z");
+
+        assert_eq!(next_run, NextRun::At(clock::get_utc_time("2026-12-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn get_next_run_after_matches_the_day_of_week_first_when_both_day_fields_are_restricted() {
+        let next_run: NextRun = get_next_run_for("0 9 20 * 1", "2026-11-15T10:00:00Z");
+
+        assert_eq!(next_run, NextRun::At(clock::get_utc_time("2026-11-16T09:00:00Z")));
+    }
+
+    #[test]
+    fn get_next_run_after_matches_the_day_of_month_first_when_both_day_fields_are_restricted() {
+        let next_run: NextRun = get_next_run_for("0 9 16 * 5", "2026-11-15T10:00:00Z");
+
+        assert_eq!(next_run, NextRun::At(clock::get_utc_time("2026-11-16T09:00:00Z")));
+    }
+
+    #[test]
+    fn get_next_run_after_finds_none_within_the_horizon_for_a_date_that_never_occurs() {
+        let next_run: NextRun = get_next_run_for("0 0 31 2 *", "2026-11-15T10:00:00Z");
+
+        assert_eq!(next_run, NextRun::NoneWithinHorizon);
     }
 
     #[test]
@@ -293,6 +448,13 @@ mod tests {
     #[test]
     fn parse_rejects_a_step_after_a_single_value() {
         assert!(CronSchedule::parse("5/10 9 * * *").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_a_stepped_wildcard_day_of_month_alongside_a_restricted_day_of_week() {
+        let error: AppError = CronSchedule::parse("0 9 */2 * 1").unwrap_err();
+
+        assert!(error.to_string().contains("launchd"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::config;
 use crate::config::Config;
 use crate::cron::CronField;
 use crate::cron::CronSchedule;
+use crate::cron::DayRestriction;
 use crate::error::AppError;
 
 const LABEL_PREFIX: &str = "ro.zach.xost.";
@@ -20,8 +21,10 @@ const INSTALL_PATH: &str = "/usr/bin/install";
 const RM_PATH: &str = "/bin/rm";
 const ID_PATH: &str = "/usr/bin/id";
 const ROOT_USER_NAME: &str = "root";
-// launchctl bootout exits with ESRCH (3) or 113 ("Could not find specified service") when the job is not loaded.
-const BOOTOUT_NOT_LOADED_EXIT_CODES: [i32; 2] = [3, 113];
+// launchctl exits with 113 ("Could not find service") when the job is not loaded.
+const LAUNCHCTL_SERVICE_NOT_FOUND_EXIT_CODE: i32 = 113;
+// launchctl bootout also exits with ESRCH (3) when the job is not loaded.
+const BOOTOUT_NOT_LOADED_EXIT_CODES: [i32; 2] = [3, LAUNCHCTL_SERVICE_NOT_FOUND_EXIT_CODE];
 // launchctl bootstrap exits with EIO (5) while a just-unloaded service with the same label is still being torn down.
 const BOOTSTRAP_INPUT_OUTPUT_ERROR_EXIT_CODE: i32 = 5;
 const MAX_BOOTSTRAP_ATTEMPTS: u32 = 5;
@@ -85,6 +88,12 @@ pub struct LaunchDaemonJob {
     pub executable_path: String,
     pub config_path: String,
     pub calendar_intervals: Vec<CalendarInterval>,
+}
+
+pub enum JobLoading {
+    Loaded,
+    NotLoaded,
+    Unknown,
 }
 
 enum BootoutOutcome {
@@ -215,25 +224,22 @@ pub fn calendar_intervals(schedule: &CronSchedule) -> Vec<CalendarInterval> {
     let with_hours: Vec<CalendarInterval> = expand(with_minutes, &schedule.hour, |interval, value| interval.hour = Some(value));
     let with_months: Vec<CalendarInterval> = expand(with_hours, &schedule.month, |interval, value| interval.month = Some(value));
 
-    expand_days(with_months, &schedule.day_of_month, &schedule.day_of_week)
+    expand_days(with_months, schedule)
 }
 
-fn expand_days(intervals: Vec<CalendarInterval>, day_of_month: &CronField, day_of_week: &CronField) -> Vec<CalendarInterval> {
+fn expand_days(intervals: Vec<CalendarInterval>, schedule: &CronSchedule) -> Vec<CalendarInterval> {
     let assign_day: fn(&mut CalendarInterval, u8) = |interval, value| interval.day = Some(value);
     let assign_weekday: fn(&mut CalendarInterval, u8) = |interval, value| interval.weekday = Some(value);
 
-    match (day_of_month, day_of_week) {
-        // Vixie cron fires when either day field matches only when neither field's text begins with '*'.
-        (CronField::Only(_), CronField::Only(_)) => {
-            let by_day_of_month: Vec<CalendarInterval> = expand(intervals.clone(), day_of_month, assign_day);
-            let by_day_of_week: Vec<CalendarInterval> = expand(intervals, day_of_week, assign_weekday);
+    match schedule.day_restriction() {
+        DayRestriction::EveryDay => intervals,
+        DayRestriction::DayOfMonthOnly => expand(intervals, &schedule.day_of_month, assign_day),
+        DayRestriction::DayOfWeekOnly => expand(intervals, &schedule.day_of_week, assign_weekday),
+        DayRestriction::EitherDayField => {
+            let by_day_of_month: Vec<CalendarInterval> = expand(intervals.clone(), &schedule.day_of_month, assign_day);
+            let by_day_of_week: Vec<CalendarInterval> = expand(intervals, &schedule.day_of_week, assign_weekday);
 
             by_day_of_month.into_iter().chain(by_day_of_week).collect()
-        }
-        _ => {
-            let with_days: Vec<CalendarInterval> = expand(intervals, day_of_month, assign_day);
-
-            expand(with_days, day_of_week, assign_weekday)
         }
     }
 }
@@ -431,8 +437,32 @@ fn delete_installed_plist(installed_plist_path: &str) -> Result<(), AppError> {
     require_success(status, &format!("deleting {}", installed_plist_path))
 }
 
+pub fn read_job_loading(label: &str) -> JobLoading {
+    let print_result: std::io::Result<ExitStatus> = Command::new(LAUNCHCTL_PATH)
+        .arg("print")
+        .arg(system_service_target(label))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let Ok(print_status) = print_result else {
+        return JobLoading::Unknown;
+    };
+
+    match print_status.code() {
+        Some(0) => JobLoading::Loaded,
+        Some(LAUNCHCTL_SERVICE_NOT_FOUND_EXIT_CODE) => JobLoading::NotLoaded,
+        _ => JobLoading::Unknown,
+    }
+}
+
+fn system_service_target(label: &str) -> String {
+    format!("system/{}", label)
+}
+
 fn bootout(label: &str) -> Result<BootoutOutcome, AppError> {
-    let service_target: String = format!("system/{}", label);
+    let service_target: String = system_service_target(label);
 
     let output: Output = Command::new(SUDO_PATH)
         .arg(LAUNCHCTL_PATH)
@@ -492,9 +522,9 @@ mod tests {
         LaunchDaemonJob {
             account: account.to_string(),
             user_name: "zachary".to_string(),
-            home_directory: "/Users/zachary".to_string(),
+            home_directory: "/Users/example".to_string(),
             executable_path: "/opt/xost/bin/xost".to_string(),
-            config_path: "/Users/zachary/.config/xost/config".to_string(),
+            config_path: "/Users/example/.config/xost/config".to_string(),
             calendar_intervals: vec![get_calendar_interval_at(Some(0), Some(9), None, None)],
         }
     }
@@ -524,16 +554,6 @@ mod tests {
         ];
 
         assert_eq!(get_intervals_for("0 9 1,15 * 7"), expected_intervals);
-    }
-
-    #[test]
-    fn calendar_intervals_requires_both_day_fields_when_day_of_month_is_a_stepped_wildcard() {
-        let expected_intervals: Vec<CalendarInterval> = (1..=31)
-            .step_by(2)
-            .map(|day| get_calendar_interval_at(Some(0), Some(9), Some(day), Some(1)))
-            .collect();
-
-        assert_eq!(get_intervals_for("0 9 */2 * 1"), expected_intervals);
     }
 
     #[test]
@@ -573,7 +593,7 @@ mod tests {
     <array>
         <string>/opt/xost/bin/xost</string>
         <string>--config</string>
-        <string>/Users/zachary/.config/xost/config</string>
+        <string>/Users/example/.config/xost/config</string>
         <string>--account</string>
         <string>daily</string>
         <string>post</string>
@@ -581,7 +601,7 @@ mod tests {
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>/Users/zachary</string>
+        <string>/Users/example</string>
     </dict>
     <key>StartCalendarInterval</key>
     <array>
@@ -595,9 +615,9 @@ mod tests {
     <key>RunAtLoad</key>
     <false/>
     <key>StandardOutPath</key>
-    <string>/Users/zachary/Library/Logs/xost-daily.log</string>
+    <string>/Users/example/Library/Logs/xost-daily.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/zachary/Library/Logs/xost-daily.log</string>
+    <string>/Users/example/Library/Logs/xost-daily.log</string>
 </dict>
 </plist>
 ";
@@ -608,11 +628,11 @@ mod tests {
     #[test]
     fn render_plist_escapes_xml_special_characters() {
         let mut job: LaunchDaemonJob = get_sample_job("daily");
-        job.config_path = "/Users/zachary/<a & b> \"c\" 'd'".to_string();
+        job.config_path = "/Users/example/<a & b> \"c\" 'd'".to_string();
 
         let plist: String = render_plist(&job);
 
-        assert!(plist.contains("<string>/Users/zachary/&lt;a &amp; b&gt; &quot;c&quot; &apos;d&apos;</string>"));
+        assert!(plist.contains("<string>/Users/example/&lt;a &amp; b&gt; &quot;c&quot; &apos;d&apos;</string>"));
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod queue;
 mod register;
 mod schedule;
 mod secrets;
+mod status;
 mod thread;
 
 use std::path::Path;
@@ -25,9 +26,12 @@ use crate::config::Config;
 use crate::deregister::DataHandling;
 use crate::error::AppError;
 use crate::queue::QueuedTweet;
+use crate::queue::StuckRecord;
 use crate::schedule::ScheduleAction;
+use crate::status::LoginCheckRequest;
 
 const MAX_POST_ATTEMPTS: u32 = 3;
+const DEFAULT_ACCOUNT: &str = "default";
 
 #[derive(Parser)]
 #[command(name = "xost", version, about = "Posts queued tweets to an X account via a browser session.")]
@@ -35,8 +39,8 @@ struct Cli {
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 
-    #[arg(long, value_name = "NAME", global = true, default_value = "default")]
-    account: String,
+    #[arg(long, value_name = "NAME", global = true)]
+    account: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -54,6 +58,10 @@ enum Command {
 
         #[arg(long)]
         delete_data: bool,
+    },
+    Status {
+        #[arg(long)]
+        check_login: bool,
     },
     #[command(flatten)]
     Account(AccountCommand),
@@ -117,7 +125,21 @@ async fn run() -> Result<(), AppError> {
             account_name,
             delete_data,
         } => deregister::run(&config_path, &account_name, data_handling(delete_data)),
-        Command::Account(account_command) => run_account_command(account_command, &config_path, &cli.account).await,
+        Command::Status { check_login } => {
+            status::run(&config_path, cli.account.as_deref(), login_check_request(check_login)).await
+        }
+        Command::Account(account_command) => {
+            let account: &str = cli.account.as_deref().unwrap_or(DEFAULT_ACCOUNT);
+
+            run_account_command(account_command, &config_path, account).await
+        }
+    }
+}
+
+fn login_check_request(check_login: bool) -> LoginCheckRequest {
+    match check_login {
+        true => LoginCheckRequest::Perform,
+        false => LoginCheckRequest::Skip,
     }
 }
 
@@ -263,13 +285,13 @@ async fn run_post(config: &Config) -> Result<(), AppError> {
     let connection: rusqlite::Connection = queue::open(&config.db_path)?;
     queue::init_schema(&connection)?;
 
-    let stuck_tweet_lookup: Option<QueuedTweet> = queue::find_stuck(&connection)?;
+    let stuck_record_lookup: Option<StuckRecord> = queue::find_stuck(&connection)?;
 
-    if let Some(stuck_tweet) = stuck_tweet_lookup {
+    if let Some(stuck_record) = stuck_record_lookup {
         let message: String = format!(
             "tweet id {} is stuck mid-post from a previous run; not retrying to avoid a duplicate. \
              Confirm on X whether it posted, then clear its posting_started_at.",
-            stuck_tweet.id,
+            stuck_record.id,
         );
         notify::send(&notification_title(config, "manual check needed"), &message);
 

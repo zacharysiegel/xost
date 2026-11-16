@@ -2,12 +2,13 @@
 
 Posts queued tweets to one or more X accounts on a daily schedule by driving a headless Chrome session. Posts come from a per-account SQLite queue that rotates: each run posts the least-recently-posted enabled entry, wrapping to the start once all have gone out.
 
-Each account is a `[account "<name>"]` section in `~/.config/xost/config`, selected with `--account <name>` (default `default`). The `<name>` is a local label you choose, restricted to letters, digits, `-`, and `_` (it names the config section, the data directory, the secret prefix, and the launchd job); it is not the @handle, which is a field inside the section. Accounts are isolated: separate queue db, separate Chrome profile, separate credentials. Authentication reuses a dedicated Chrome profile per account (isolated from your personal browser); the X session cookie lives there, not in this code. The password never reaches the command line or the database. It is read from a shared [`secr`](https://crates.io/crates/secr) store only when the tool needs to log itself back in after the session expires.
+Each account is a `[account "<name>"]` section in `~/.config/xost/config`, selected with `--account <name>`. The `<name>` is a local label you choose, restricted to letters, digits, `-`, and `_` (it names the config section, the data directory, the secret prefix, and the launchd job); it is not the @handle, which is a field inside the section. Accounts are isolated: separate queue db, separate Chrome profile, separate credentials. Authentication reuses a dedicated Chrome profile per account (isolated from your personal browser); the X session cookie lives there, not in this code. The password never reaches the command line or the database. It is read from a shared [`secr`](https://crates.io/crates/secr) store only when the tool needs to log itself back in after the session expires.
 
 ## Commands
 
 - `xost register <name>` — create the account's config section, its secrets and its data directory by answering prompts. See Setup.
 - `xost deregister <name> [--delete-data]` — after a `[y/N]` confirmation, remove the account's LaunchDaemon (via `sudo`), its secrets and its config section; `--delete-data` also deletes its queue db, Chrome profile and, if then empty, their directory, keeping any of these that another account's `db` or `profile` path equals, contains or lies inside.
+- `xost [--account <name>] status [--check-login]` — read-only report on every account unless `--account` is given: config validity, schedule, next run, LaunchDaemon plist and load state, queue counts, next, stuck and failed records, and session cookie expiry; `--check-login` also opens each account headless to check X shows it logged in.
 - `xost --account <name> post` — post the next queued tweet. Headless. The scheduled daily run.
 - `xost --account <name> login` — open your normal Chrome (not an automated session) on the account's profile to sign in by hand and refresh the session.
 - `xost --account <name> enqueue [--heading "<text>"] --body "<text>" [--source-url <url>] [--order <n>]` — add a tweet. Order defaults to the end. A heading is posted before the body, joined by the account's `heading_separator` (default one space). `--source-url` is the record's link for the overflow post or the source post (see Threads under Behavior).
@@ -16,7 +17,7 @@ Each account is a `[account "<name>"]` section in `~/.config/xost/config`, selec
 - `xost --account <name> import-session --from <file>` — load session cookies from a JSON file into this profile and confirm it's logged in.
 - `xost --account <name> schedule [--remove | --print]` — install (or replace) a LaunchDaemon that runs `post` on the account's `schedule` cron expression. `--remove` unloads and deletes it; `--print` prints the plist without installing anything. Installing and removing run `sudo`. See Schedule under Setup.
 
-`--account` defaults to `default`. `--config <path>` overrides the config location (default `~/.config/xost/config`).
+`--account` defaults to `default` for the other commands. `--config <path>` overrides the config location (default `~/.config/xost/config`).
 
 ## Config
 
@@ -55,7 +56,7 @@ Per-account files live under `~/.local/share/xost/<name>/`. Nothing sensitive go
 
        ./target/release/xost --account default enqueue --body "first post"
 
-5. Schedule. The account's `schedule` key holds a five-field cron expression (minute hour day-of-month month day-of-week; numbers, `*`, lists, ranges and `/` steps), e.g. `schedule = 0 9 * * *`, set by `register` or by editing the config. Then:
+5. Schedule. The account's `schedule` key holds a five-field cron expression (minute hour day-of-month month day-of-week; numbers, `*`, lists, ranges and `/` steps), e.g. `schedule = 0 9 * * *`, set by `register` or by editing the config. With both day fields restricted it runs on days matching either; a schedule that restricts both day fields with one beginning with `*` (e.g. `0 9 */2 * 1`) is rejected, because launchd cannot run on days matching both. Then:
 
        ./target/release/xost --account default schedule
 

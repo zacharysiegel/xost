@@ -51,6 +51,11 @@ pub enum PostFailure {
     AfterPublish(AppError),
 }
 
+pub enum LoginState {
+    LoggedIn,
+    LoggedOut,
+}
+
 pub struct Session {
     browser: Browser,
     page: Page,
@@ -100,14 +105,24 @@ impl Session {
     }
 
     pub async fn ensure_logged_in(&self, config: &Config) -> Result<(), AppError> {
+        let login_state: LoginState = self.observe_login_state().await?;
+
+        match login_state {
+            LoginState::LoggedIn => Ok(()),
+            LoginState::LoggedOut => self.log_in(config).await,
+        }
+    }
+
+    pub async fn observe_login_state(&self) -> Result<LoginState, AppError> {
         self.page.goto(URL_HOME).await?;
         self.page.wait_for_navigation().await?;
 
-        if self.is_logged_in().await {
-            return Ok(());
-        }
+        let logged_in: bool = self.is_logged_in().await;
 
-        self.log_in(config).await
+        match logged_in {
+            true => Ok(LoginState::LoggedIn),
+            false => Ok(LoginState::LoggedOut),
+        }
     }
 
     pub async fn diagnose(&self, screenshot_path: &str) -> Result<(), AppError> {
