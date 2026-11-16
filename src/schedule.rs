@@ -340,11 +340,11 @@ fn escape_xml(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn job_label(account: &str) -> String {
+pub fn job_label(account: &str) -> String {
     format!("{}{}", LABEL_PREFIX, account)
 }
 
-fn installed_plist_path(label: &str) -> String {
+pub fn installed_plist_path(label: &str) -> String {
     format!("{}/{}.plist", LAUNCH_DAEMONS_DIRECTORY, label)
 }
 
@@ -474,11 +474,11 @@ fn require_success(status: ExitStatus, description: &str) -> Result<(), AppError
 mod tests {
     use super::*;
 
-    fn intervals_for(expression: &str) -> Vec<CalendarInterval> {
+    fn get_intervals_for(expression: &str) -> Vec<CalendarInterval> {
         calendar_intervals(&CronSchedule::parse(expression).unwrap())
     }
 
-    fn at(minute: Option<u8>, hour: Option<u8>, day: Option<u8>, weekday: Option<u8>) -> CalendarInterval {
+    fn get_calendar_interval_at(minute: Option<u8>, hour: Option<u8>, day: Option<u8>, weekday: Option<u8>) -> CalendarInterval {
         CalendarInterval {
             minute,
             hour,
@@ -488,52 +488,52 @@ mod tests {
         }
     }
 
-    fn sample_job(account: &str) -> LaunchDaemonJob {
+    fn get_sample_job(account: &str) -> LaunchDaemonJob {
         LaunchDaemonJob {
             account: account.to_string(),
             user_name: "zachary".to_string(),
             home_directory: "/Users/zachary".to_string(),
             executable_path: "/opt/xost/bin/xost".to_string(),
             config_path: "/Users/zachary/.config/xost/config".to_string(),
-            calendar_intervals: vec![at(Some(0), Some(9), None, None)],
+            calendar_intervals: vec![get_calendar_interval_at(Some(0), Some(9), None, None)],
         }
     }
 
     #[test]
     fn calendar_intervals_expands_a_minute_step() {
         let expected_intervals: Vec<CalendarInterval> = vec![
-            at(Some(0), Some(9), None, None),
-            at(Some(20), Some(9), None, None),
-            at(Some(40), Some(9), None, None),
+            get_calendar_interval_at(Some(0), Some(9), None, None),
+            get_calendar_interval_at(Some(20), Some(9), None, None),
+            get_calendar_interval_at(Some(40), Some(9), None, None),
         ];
 
-        assert_eq!(intervals_for("*/20 9 * * *"), expected_intervals);
+        assert_eq!(get_intervals_for("*/20 9 * * *"), expected_intervals);
     }
 
     #[test]
     fn calendar_intervals_omits_every_wildcard_field() {
-        assert_eq!(intervals_for("* * * * *"), vec![CalendarInterval::unrestricted()]);
+        assert_eq!(get_intervals_for("* * * * *"), vec![CalendarInterval::unrestricted()]);
     }
 
     #[test]
     fn calendar_intervals_unions_day_of_month_and_day_of_week_when_both_are_restricted() {
         let expected_intervals: Vec<CalendarInterval> = vec![
-            at(Some(0), Some(9), Some(1), None),
-            at(Some(0), Some(9), Some(15), None),
-            at(Some(0), Some(9), None, Some(0)),
+            get_calendar_interval_at(Some(0), Some(9), Some(1), None),
+            get_calendar_interval_at(Some(0), Some(9), Some(15), None),
+            get_calendar_interval_at(Some(0), Some(9), None, Some(0)),
         ];
 
-        assert_eq!(intervals_for("0 9 1,15 * 7"), expected_intervals);
+        assert_eq!(get_intervals_for("0 9 1,15 * 7"), expected_intervals);
     }
 
     #[test]
     fn calendar_intervals_requires_both_day_fields_when_day_of_month_is_a_stepped_wildcard() {
         let expected_intervals: Vec<CalendarInterval> = (1..=31)
             .step_by(2)
-            .map(|day| at(Some(0), Some(9), Some(day), Some(1)))
+            .map(|day| get_calendar_interval_at(Some(0), Some(9), Some(day), Some(1)))
             .collect();
 
-        assert_eq!(intervals_for("0 9 */2 * 1"), expected_intervals);
+        assert_eq!(get_intervals_for("0 9 */2 * 1"), expected_intervals);
     }
 
     #[test]
@@ -555,7 +555,7 @@ mod tests {
             },
         ];
 
-        assert_eq!(intervals_for("0 9 * 6,12 1"), expected_intervals);
+        assert_eq!(get_intervals_for("0 9 * 6,12 1"), expected_intervals);
     }
 
     #[test]
@@ -602,12 +602,12 @@ mod tests {
 </plist>
 ";
 
-        assert_eq!(render_plist(&sample_job("daily")), expected_plist);
+        assert_eq!(render_plist(&get_sample_job("daily")), expected_plist);
     }
 
     #[test]
     fn render_plist_escapes_xml_special_characters() {
-        let mut job: LaunchDaemonJob = sample_job("daily");
+        let mut job: LaunchDaemonJob = get_sample_job("daily");
         job.config_path = "/Users/zachary/<a & b> \"c\" 'd'".to_string();
 
         let plist: String = render_plist(&job);

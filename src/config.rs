@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::cron::CronSchedule;
 use crate::error::AppError;
+use crate::private_file;
 use crate::secrets;
 use crate::thread;
 use crate::thread::ThreadNumbering;
@@ -227,6 +228,11 @@ pub fn default_config_path() -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(home).join(".config").join("xost").join("config"))
 }
 
+pub fn read_existing_config(config_path: &std::path::Path) -> Result<String, AppError> {
+    private_file::read_existing_text(config_path)
+        .map_err(|error| AppError::new(&format!("could not read config at {}: {}", config_path.display(), error)))
+}
+
 pub fn secrets_section_header() -> String {
     format!("[{}]", SECRETS_SECTION)
 }
@@ -251,9 +257,8 @@ pub fn parse(contents: &str) -> Result<Vec<Section>, AppError> {
             continue;
         }
 
-        if line.starts_with('[') && line.ends_with(']') {
-            let header: Section = parse_header(&line[1..line.len() - 1])?;
-            sections.push(header);
+        if let Some(header_inner) = get_section_header_inner(line) {
+            sections.push(parse_header(header_inner));
 
             continue;
         }
@@ -272,25 +277,43 @@ pub fn parse(contents: &str) -> Result<Vec<Section>, AppError> {
     Ok(sections)
 }
 
-fn parse_header(inner: &str) -> Result<Section, AppError> {
+fn get_section_header_inner(trimmed_line: &str) -> Option<&str> {
+    trimmed_line.strip_prefix('[')?.strip_suffix(']')
+}
+
+fn parse_header(inner: &str) -> Section {
     let inner: &str = inner.trim();
 
     match inner.split_once(char::is_whitespace) {
         Some((kind, rest)) => {
             let name: &str = rest.trim().trim_matches('"');
 
-            Ok(Section {
+            Section {
                 kind: kind.to_string(),
                 name: Some(name.to_string()),
                 values: BTreeMap::new(),
-            })
+            }
         }
-        None => Ok(Section {
+        None => Section {
             kind: inner.to_string(),
             name: None,
             values: BTreeMap::new(),
-        }),
+        },
     }
+}
+
+pub fn is_section_header_line(raw_line: &str) -> bool {
+    get_section_header_inner(raw_line.trim()).is_some()
+}
+
+pub fn is_account_section_header_line(raw_line: &str, account: &str) -> bool {
+    let Some(header_inner) = get_section_header_inner(raw_line.trim()) else {
+        return false;
+    };
+
+    let header: Section = parse_header(header_inner);
+
+    header.kind == ACCOUNT_SECTION && header.name.as_deref() == Some(account)
 }
 
 pub fn find_section<'a>(sections: &'a [Section], kind: &str, name: Option<&str>) -> Option<&'a BTreeMap<String, String>> {
@@ -300,11 +323,28 @@ pub fn find_section<'a>(sections: &'a [Section], kind: &str, name: Option<&str>)
         .map(|section| &section.values)
 }
 
-fn account_names(sections: &[Section]) -> String {
-    let names: Vec<&str> = sections
+pub struct NamedSection<'a> {
+    pub name: &'a str,
+    pub values: &'a BTreeMap<String, String>,
+}
+
+pub fn find_named_sections<'a>(sections: &'a [Section], kind: &str) -> Vec<NamedSection<'a>> {
+    sections
         .iter()
-        .filter(|section| section.kind == ACCOUNT_SECTION)
-        .filter_map(|section| section.name.as_deref())
+        .filter(|section| section.kind == kind)
+        .filter_map(|section| {
+            section.name.as_deref().map(|name| NamedSection {
+                name,
+                values: &section.values,
+            })
+        })
+        .collect()
+}
+
+fn account_names(sections: &[Section]) -> String {
+    let names: Vec<&str> = find_named_sections(sections, ACCOUNT_SECTION)
+        .into_iter()
+        .map(|account_section| account_section.name)
         .collect();
 
     if names.is_empty() {
@@ -370,7 +410,7 @@ mod tests {
   profile = /tmp/gimmick2/profile
 ";
 
-    fn config_from(contents: &str, account: &str) -> Result<Config, AppError> {
+    fn get_config_from(contents: &str, account: &str) -> Result<Config, AppError> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         let unique: u64 = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -385,7 +425,7 @@ mod tests {
 
     #[test]
     fn load_reads_the_requested_account_section() {
-        let config: Config = config_from(SAMPLE, "gimmick1").unwrap();
+        let config: Config = get_config_from(SAMPLE, "gimmick1").unwrap();
 
         assert_eq!(config.handle, "funnybot");
         assert_eq!(config.username, "funnybot@example.com");
@@ -394,14 +434,14 @@ mod tests {
 
     #[test]
     fn username_defaults_to_handle_when_absent() {
-        let config: Config = config_from(SAMPLE, "gimmick2").unwrap();
+        let config: Config = get_config_from(SAMPLE, "gimmick2").unwrap();
 
         assert_eq!(config.username, "otherbot");
     }
 
     #[test]
     fn secret_names_are_derived_from_the_account() {
-        let config: Config = config_from(SAMPLE, "gimmick1").unwrap();
+        let config: Config = get_config_from(SAMPLE, "gimmick1").unwrap();
 
         assert_eq!(config.password_secret, "gimmick1_password");
         assert_eq!(config.totp_seed_secret, "gimmick1_totp_seed");
@@ -409,7 +449,7 @@ mod tests {
 
     #[test]
     fn secrets_section_is_shared_across_accounts() {
-        let config: Config = config_from(SAMPLE, "gimmick2").unwrap();
+        let config: Config = get_config_from(SAMPLE, "gimmick2").unwrap();
 
         assert_eq!(config.secr_store_path, PathBuf::from("/tmp/secrets.yaml"));
         assert_eq!(config.secr_key_base64, "AAAABBBB");
@@ -417,24 +457,24 @@ mod tests {
 
     #[test]
     fn unknown_account_is_an_error() {
-        assert!(config_from(SAMPLE, "missing").is_err());
+        assert!(get_config_from(SAMPLE, "missing").is_err());
     }
 
     #[test]
     fn account_name_with_spaces_is_rejected() {
-        assert!(config_from(SAMPLE, "Nietzsche Dawn Daily").is_err());
+        assert!(get_config_from(SAMPLE, "Nietzsche Dawn Daily").is_err());
     }
 
     #[test]
     fn heading_separator_defaults_to_a_single_space() {
-        let config: Config = config_from(SAMPLE, "gimmick1").unwrap();
+        let config: Config = get_config_from(SAMPLE, "gimmick1").unwrap();
 
         assert_eq!(config.heading_separator, " ");
     }
 
     #[test]
     fn load_uses_the_thread_defaults_when_absent() {
-        let config: Config = config_from(SAMPLE, "gimmick1").unwrap();
+        let config: Config = get_config_from(SAMPLE, "gimmick1").unwrap();
 
         assert_eq!(config.thread_settings.post_limit, 280);
         assert_eq!(config.thread_settings.max_posts, 9);
@@ -447,33 +487,33 @@ mod tests {
     fn load_rejects_a_thread_numbering_other_than_all_posts_or_first_post() {
         let contents: String = format!("{}  thread_numbering = every\n", SAMPLE);
 
-        assert!(config_from(&contents, "gimmick2").is_err());
+        assert!(get_config_from(&contents, "gimmick2").is_err());
     }
 
     #[test]
     fn load_rejects_a_thread_max_posts_of_zero() {
         let contents: String = format!("{}  thread_max_posts = 0\n", SAMPLE);
 
-        assert!(config_from(&contents, "gimmick2").is_err());
+        assert!(get_config_from(&contents, "gimmick2").is_err());
     }
 
     #[test]
     fn load_rejects_an_overflow_label_whose_post_exceeds_thread_post_limit() {
         let contents: String = format!("{}  thread_post_limit = 30\n  thread_overflow_label = Full text\n", SAMPLE);
 
-        assert!(config_from(&contents, "gimmick2").is_err());
+        assert!(get_config_from(&contents, "gimmick2").is_err());
     }
 
     #[test]
     fn load_rejects_a_source_label_whose_post_exceeds_thread_post_limit() {
         let contents: String = format!("{}  thread_post_limit = 30\n  thread_source_label = Source\n", SAMPLE);
 
-        assert!(config_from(&contents, "gimmick2").is_err());
+        assert!(get_config_from(&contents, "gimmick2").is_err());
     }
 
     #[test]
     fn load_leaves_the_schedule_unset_when_absent() {
-        let config: Config = config_from(SAMPLE, "gimmick1").unwrap();
+        let config: Config = get_config_from(SAMPLE, "gimmick1").unwrap();
 
         assert_eq!(config.schedule, None);
     }
@@ -482,7 +522,7 @@ mod tests {
     fn load_parses_the_schedule() {
         let contents: String = format!("{}  schedule = 0 9 * * *\n", SAMPLE);
 
-        let config: Config = config_from(&contents, "gimmick2").unwrap();
+        let config: Config = get_config_from(&contents, "gimmick2").unwrap();
 
         assert_eq!(config.schedule, Some(CronSchedule::parse("0 9 * * *").unwrap()));
     }
@@ -491,7 +531,7 @@ mod tests {
     fn load_rejects_an_invalid_schedule() {
         let contents: String = format!("{}  schedule = 0 9 * * MON\n", SAMPLE);
 
-        assert!(config_from(&contents, "gimmick2").is_err());
+        assert!(get_config_from(&contents, "gimmick2").is_err());
     }
 
     #[test]

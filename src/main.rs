@@ -2,8 +2,11 @@ mod browser;
 mod clock;
 mod config;
 mod cron;
+mod deregister;
 mod error;
 mod notify;
+mod private_file;
+mod prompt;
 mod queue;
 mod register;
 mod schedule;
@@ -19,6 +22,7 @@ use clap::Subcommand;
 use crate::browser::PostFailure;
 use crate::browser::Session;
 use crate::config::Config;
+use crate::deregister::DataHandling;
 use crate::error::AppError;
 use crate::queue::QueuedTweet;
 use crate::schedule::ScheduleAction;
@@ -43,6 +47,13 @@ enum Command {
     Register {
         #[arg(value_name = "ACCOUNT")]
         account_name: String,
+    },
+    Deregister {
+        #[arg(value_name = "ACCOUNT")]
+        account_name: String,
+
+        #[arg(long)]
+        delete_data: bool,
     },
     #[command(flatten)]
     Account(AccountCommand),
@@ -102,7 +113,18 @@ async fn run() -> Result<(), AppError> {
 
     match cli.command {
         Command::Register { account_name } => register::run(&config_path, cli.config.as_deref(), &account_name),
+        Command::Deregister {
+            account_name,
+            delete_data,
+        } => deregister::run(&config_path, &account_name, data_handling(delete_data)),
         Command::Account(account_command) => run_account_command(account_command, &config_path, &cli.account).await,
+    }
+}
+
+fn data_handling(delete_data: bool) -> DataHandling {
+    match delete_data {
+        true => DataHandling::Delete,
+        false => DataHandling::Keep,
     }
 }
 

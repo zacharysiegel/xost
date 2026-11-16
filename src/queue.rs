@@ -209,14 +209,14 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedTweet> {
 mod tests {
     use super::*;
 
-    fn fresh_db() -> Connection {
+    fn create_fresh_db() -> Connection {
         let connection: Connection = Connection::open_in_memory().unwrap();
         init_schema(&connection).unwrap();
 
         connection
     }
 
-    fn last_posted_at(connection: &Connection, id: i64) -> Option<String> {
+    fn get_last_posted_at(connection: &Connection, id: i64) -> Option<String> {
         connection
             .query_row("select last_posted_at from tweet_queue where id = ?1", params![id], |row| row.get(0))
             .unwrap()
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn enqueue_assigns_incrementing_order() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
 
         enqueue(&connection, None, "a", None, None).unwrap();
         enqueue(&connection, None, "b", None, None).unwrap();
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn select_next_returns_the_source_url_given_to_enqueue() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         enqueue(&connection, None, "a", Some("https://example.com/full-text"), None).unwrap();
 
         let next: QueuedTweet = select_next(&connection).unwrap().unwrap();
@@ -292,14 +292,14 @@ mod tests {
 
     #[test]
     fn select_next_is_none_when_queue_empty() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
 
         assert!(select_next(&connection).unwrap().is_none());
     }
 
     #[test]
     fn select_next_returns_lowest_queue_order_when_none_posted() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         enqueue(&connection, None, "later", None, Some(2)).unwrap();
         enqueue(&connection, None, "sooner", None, Some(1)).unwrap();
 
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn select_next_rotates_back_to_start_after_all_posted() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         enqueue(&connection, None, "a", None, Some(1)).unwrap();
         enqueue(&connection, None, "b", None, Some(2)).unwrap();
 
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn select_next_skips_a_locked_row() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         enqueue(&connection, None, "a", None, Some(1)).unwrap();
         enqueue(&connection, None, "b", None, Some(2)).unwrap();
 
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn select_next_skips_a_failed_record() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         let failed_id: i64 = enqueue(&connection, None, "a", None, Some(1)).unwrap();
         enqueue(&connection, None, "b", None, Some(2)).unwrap();
         connection
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn find_stuck_reports_only_a_locked_row() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         let id: i64 = enqueue(&connection, None, "a", None, None).unwrap();
 
         assert!(find_stuck(&connection).unwrap().is_none());
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn record_failed_attempt_unlocks_and_keeps_the_record_selectable() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         let id: i64 = enqueue(&connection, None, "a", None, None).unwrap();
         mark_posting(&connection, id).unwrap();
 
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn release_lock_unlocks_without_recording_a_failure() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         let id: i64 = enqueue(&connection, None, "a", None, None).unwrap();
         mark_posting(&connection, id).unwrap();
 
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn mark_failed_records_the_failure_time_and_error_and_clears_the_lock() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         let id: i64 = enqueue(&connection, None, "a", None, None).unwrap();
         mark_posting(&connection, id).unwrap();
 
@@ -428,13 +428,13 @@ mod tests {
 
     #[test]
     fn mark_posted_clears_the_lock_and_records_the_time() {
-        let connection: Connection = fresh_db();
+        let connection: Connection = create_fresh_db();
         let id: i64 = enqueue(&connection, None, "a", None, None).unwrap();
         mark_posting(&connection, id).unwrap();
 
         mark_posted(&connection, id).unwrap();
 
         assert!(find_stuck(&connection).unwrap().is_none());
-        assert!(last_posted_at(&connection, id).is_some());
+        assert!(get_last_posted_at(&connection, id).is_some());
     }
 }

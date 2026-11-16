@@ -1,9 +1,3 @@
-use std::fs::OpenOptions;
-use std::fs::Permissions;
-use std::io::BufRead;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -11,11 +5,13 @@ use crate::config;
 use crate::config::Section;
 use crate::cron::CronSchedule;
 use crate::error::AppError;
+use crate::private_file;
+use crate::prompt;
 use crate::secrets;
+use crate::secrets::StoreContents;
 
 const DEFAULT_SECRETS_STORE: &str = "~/.config/xost/secrets.yaml";
 const DATA_ROOT: &str = "~/.local/share/xost";
-const OWNER_ONLY_FILE_MODE: u32 = 0o600;
 
 pub struct AccountSettings {
     pub handle: String,
@@ -63,12 +59,6 @@ impl ConfigPlan {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub enum StoreContents {
-    MissingOrBlank,
-    HasContent,
-}
-
 pub struct PendingSecret {
     pub name: String,
     pub plaintext: String,
@@ -82,13 +72,13 @@ pub struct SecretPartition {
 pub fn run(config_path: &Path, explicit_config_path: Option<&Path>, account: &str) -> Result<(), AppError> {
     config::validate_account_name(account)?;
 
-    let existing_config: String = read_existing_config(config_path)?;
+    let existing_config: String = config::read_existing_config(config_path)?;
     let sections: Vec<Section> = config::parse(&existing_config)?;
 
     let secrets_plan: SecretsPlan = plan_secrets(&sections, &secrets::generate_key_base64())?;
     let key: Vec<u8> = secrets::decode_key(&secrets_plan.location.key_base64)?;
     let store_path: PathBuf = config::expand_user_path(&secrets_plan.location.store);
-    let store_contents: StoreContents = read_store_contents(&store_path)?;
+    let store_contents: StoreContents = secrets::read_store_contents(&store_path)?;
     require_store_usable_with_key(&secrets_plan.section, &store_contents, &store_path)?;
 
     let settings: AccountSettings = prompt_account_settings()?;
@@ -99,7 +89,7 @@ pub fn run(config_path: &Path, explicit_config_path: Option<&Path>, account: &st
         account_section: plan_account_section(&sections, account, &settings),
     };
 
-    append_to_private_file(config_path, &config_text_to_append(&existing_config, &plan))?;
+    private_file::append_to_private_file(config_path, &config_text_to_append(&existing_config, &plan))?;
     report_kept_section(&plan.secrets.section, &config::secrets_section_header(), config_path);
     report_kept_section(&plan.account_section, &config::account_section_header(account), config_path);
 
@@ -142,16 +132,6 @@ pub fn plan_account_section(sections: &[Section], account: &str, settings: &Acco
         Some(_) => SectionChange::KeepExisting,
         None => SectionChange::Append(render_account_section(account, settings)),
     }
-}
-
-fn read_store_contents(store_path: &Path) -> Result<StoreContents, AppError> {
-    let existing_store: String = read_existing_text(store_path)?;
-
-    if existing_store.trim().is_empty() {
-        return Ok(StoreContents::MissingOrBlank);
-    }
-
-    Ok(StoreContents::HasContent)
 }
 
 pub fn require_store_usable_with_key(
@@ -282,42 +262,12 @@ fn store_secrets(store_path: &Path, key: &Vec<u8>, pending: Vec<PendingSecret>) 
         entries.push(secrets::render_encrypted_entry(key, &pending_secret.name, &pending_secret.plaintext)?);
     }
 
-    let existing_store: String = read_existing_text(store_path)?;
-    append_to_private_file(store_path, &text_to_append(&existing_store, &entries))?;
+    let existing_store: String = private_file::read_existing_text(store_path)?;
+    private_file::append_to_private_file(store_path, &text_to_append(&existing_store, &entries))?;
 
     for name in &partition.already_stored {
         println!("secret '{}' is already in {}; leaving it unchanged", name, store_path.display());
     }
-
-    Ok(())
-}
-
-fn read_existing_config(config_path: &Path) -> Result<String, AppError> {
-    read_existing_text(config_path)
-        .map_err(|error| AppError::new(&format!("could not read config at {}: {}", config_path.display(), error)))
-}
-
-fn read_existing_text(path: &Path) -> Result<String, AppError> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-pub fn append_to_private_file(path: &Path, text: &str) -> Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut file: std::fs::File = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(OWNER_ONLY_FILE_MODE)
-        .open(path)?;
-    file.write_all(text.as_bytes())?;
-
-    std::fs::set_permissions(path, Permissions::from_mode(OWNER_ONLY_FILE_MODE))?;
 
     Ok(())
 }
@@ -356,12 +306,12 @@ pub fn xost_command_prefix(explicit_config_path: Option<&Path>) -> String {
 
 fn prompt_account_settings() -> Result<AccountSettings, AppError> {
     let handle: String = prompt_until_non_empty(
-        || prompt_line("X handle, without the @: ").map(|answer| normalize_handle(&answer)),
+        || prompt::read_line_answer("X handle, without the @: ").map(|answer| normalize_handle(&answer)),
         "the handle is required",
     )?;
 
-    let username_answer: String = prompt_line(&format!("Login identifier (email, phone or handle) [{}]: ", handle))?;
-    let chrome_answer: String = prompt_line("Chrome binary path (blank to auto-detect): ")?;
+    let username_answer: String = prompt::read_line_answer(&format!("Login identifier (email, phone or handle) [{}]: ", handle))?;
+    let chrome_answer: String = prompt::read_line_answer("Chrome binary path (blank to auto-detect): ")?;
     let schedule: Option<String> = prompt_schedule()?;
 
     Ok(AccountSettings {
@@ -389,7 +339,7 @@ fn prompt_credentials(account: &str) -> Result<Credentials, AppError> {
 fn prompt_schedule() -> Result<Option<String>, AppError> {
     loop {
         let answer: String =
-            prompt_line("Schedule as a cron expression: minute hour day-of-month month day-of-week (blank for none): ")?;
+            prompt::read_line_answer("Schedule as a cron expression: minute hour day-of-month month day-of-week (blank for none): ")?;
         let parsed: Result<Option<String>, AppError> = parse_schedule_answer(&answer);
 
         match parsed {
@@ -412,20 +362,6 @@ fn prompt_until_non_empty(
 
         println!("{}", missing_message);
     }
-}
-
-fn prompt_line(prompt: &str) -> Result<String, AppError> {
-    print!("{}", prompt);
-    std::io::stdout().flush()?;
-
-    let mut answer: String = String::new();
-    let bytes_read: usize = std::io::stdin().lock().read_line(&mut answer)?;
-
-    if bytes_read == 0 {
-        return Err(AppError::new("standard input closed before registration finished"));
-    }
-
-    Ok(answer.trim().to_string())
 }
 
 fn prompt_hidden(prompt: &str) -> Result<String, AppError> {
@@ -484,7 +420,7 @@ mod tests {
   profile = /tmp/daily/profile
 ";
 
-    fn sample_settings() -> AccountSettings {
+    fn get_sample_settings() -> AccountSettings {
         AccountSettings {
             handle: "funnybot".to_string(),
             username: "funnybot@example.com".to_string(),
@@ -493,18 +429,18 @@ mod tests {
         }
     }
 
-    fn plan_against(existing_config: &str, account: &str) -> ConfigPlan {
+    fn get_plan_against(existing_config: &str, account: &str) -> ConfigPlan {
         let sections: Vec<Section> = config::parse(existing_config).unwrap();
 
         ConfigPlan {
             secrets: plan_secrets(&sections, "NEWKEY").unwrap(),
-            account_section: plan_account_section(&sections, account, &sample_settings()),
+            account_section: plan_account_section(&sections, account, &get_sample_settings()),
         }
     }
 
     #[test]
     fn config_text_to_append_writes_a_secrets_section_and_the_account_section_into_a_new_file() {
-        let plan: ConfigPlan = plan_against("", "gimmick");
+        let plan: ConfigPlan = get_plan_against("", "gimmick");
 
         let expected: &str = "\
 [secrets]
@@ -522,7 +458,7 @@ mod tests {
 
     #[test]
     fn plan_secrets_reuses_an_existing_secrets_section() {
-        let plan: ConfigPlan = plan_against(EXISTING_CONFIG, "gimmick");
+        let plan: ConfigPlan = get_plan_against(EXISTING_CONFIG, "gimmick");
 
         let expected_location: SecretsLocation = SecretsLocation {
             store: "/tmp/existing-secrets.yaml".to_string(),
@@ -534,7 +470,7 @@ mod tests {
 
     #[test]
     fn plan_account_section_leaves_an_existing_account_section_unchanged() {
-        let plan: ConfigPlan = plan_against(EXISTING_CONFIG, "daily");
+        let plan: ConfigPlan = get_plan_against(EXISTING_CONFIG, "daily");
 
         assert_eq!(plan.account_section, SectionChange::KeepExisting);
     }
@@ -602,7 +538,7 @@ mod tests {
         let contents: String = format!(
             "{}\n{}",
             render_secrets_section(&location),
-            render_account_section("gimmick", &sample_settings()),
+            render_account_section("gimmick", &get_sample_settings()),
         );
         std::fs::write(&config_path, contents).unwrap();
 
@@ -661,18 +597,6 @@ mod tests {
             .collect();
         assert_eq!(appended_names, vec!["gimmick_totp_seed".to_string()]);
         assert_eq!(partition.already_stored, vec!["gimmick_password".to_string()]);
-    }
-
-    #[test]
-    fn append_to_private_file_creates_the_file_readable_only_by_its_owner() {
-        let directory: PathBuf = std::env::temp_dir().join(format!("xost-register-test-{}", std::process::id()));
-        let path: PathBuf = directory.join("nested").join("config");
-
-        append_to_private_file(&path, "[secrets]\n").unwrap();
-        let mode: u32 = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        std::fs::remove_dir_all(&directory).ok();
-
-        assert_eq!(mode, OWNER_ONLY_FILE_MODE);
     }
 
     #[test]

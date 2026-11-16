@@ -7,6 +7,7 @@ Each account is a `[account "<name>"]` section in `~/.config/xost/config`, selec
 ## Commands
 
 - `xost register <name>` — create the account's config section, its secrets and its data directory by answering prompts. See Setup.
+- `xost deregister <name> [--delete-data]` — after a `[y/N]` confirmation, remove the account's LaunchDaemon (via `sudo`), its secrets and its config section; `--delete-data` also deletes its queue db, Chrome profile and, if then empty, their directory, keeping any of these that another account's `db` or `profile` path equals, contains or lies inside.
 - `xost --account <name> post` — post the next queued tweet. Headless. The scheduled daily run.
 - `xost --account <name> login` — open your normal Chrome (not an automated session) on the account's profile to sign in by hand and refresh the session.
 - `xost --account <name> enqueue [--heading "<text>"] --body "<text>" [--source-url <url>] [--order <n>]` — add a tweet. Order defaults to the end. A heading is posted before the body, joined by the account's `heading_separator` (default one space). `--source-url` is the record's link for the overflow post or the source post (see Threads under Behavior).

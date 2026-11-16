@@ -224,7 +224,7 @@ fn with_sunday_as_0(mut values: BTreeSet<u8>) -> BTreeSet<u8> {
 mod tests {
     use super::*;
 
-    fn only(values: &[u8]) -> CronField {
+    fn get_field_matching_only(values: &[u8]) -> CronField {
         CronField::Only(values.iter().copied().collect())
     }
 
@@ -239,7 +239,7 @@ mod tests {
     fn parse_expands_a_comma_list_of_values_and_ranges() {
         let schedule: CronSchedule = CronSchedule::parse("0 1,5-7,23 * * *").unwrap();
 
-        assert_eq!(schedule.hour, only(&[1, 5, 6, 7, 23]));
+        assert_eq!(schedule.hour, get_field_matching_only(&[1, 5, 6, 7, 23]));
     }
 
     #[test]
@@ -253,14 +253,14 @@ mod tests {
     fn parse_expands_a_step_over_a_range() {
         let schedule: CronSchedule = CronSchedule::parse("0 0 1-10/4 * *").unwrap();
 
-        assert_eq!(schedule.day_of_month, only(&[1, 5, 9]));
+        assert_eq!(schedule.day_of_month, get_field_matching_only(&[1, 5, 9]));
     }
 
     #[test]
     fn parse_stores_day_of_week_7_as_sunday_0() {
         let schedule: CronSchedule = CronSchedule::parse("0 9 * * 5-7").unwrap();
 
-        assert_eq!(schedule.day_of_week, only(&[0, 5, 6]));
+        assert_eq!(schedule.day_of_week, get_field_matching_only(&[0, 5, 6]));
     }
 
     #[test]
