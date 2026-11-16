@@ -6,6 +6,8 @@ const LINK_URL_WEIGHT: usize = 23;
 
 const LINK_LABEL_SEPARATOR: &str = ": ";
 
+const NUMBERING_SEPARATOR: &str = "\n";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadNumbering {
     AllPosts,
@@ -132,7 +134,7 @@ fn numbering_suffix(position: usize, post_total: usize, numbering: ThreadNumberi
         return String::new();
     }
 
-    format!(" {}/{}", position, post_total)
+    format!("{}{}/{}", NUMBERING_SEPARATOR, position, post_total)
 }
 
 fn cut_post(remaining: &str, capacity: usize) -> Result<PostCut<'_>, AppError> {
@@ -267,7 +269,7 @@ mod tests {
 
         let post_texts: Vec<String> = split_post_text(&create_numbered_words(20), Some(SOURCE_URL), &settings).unwrap();
         let text_post_total: usize = post_texts.len() - 1;
-        let last_text_post_suffix: String = format!(" {}/{}", text_post_total, text_post_total);
+        let last_text_post_suffix: String = format!("{}{}/{}", NUMBERING_SEPARATOR, text_post_total, text_post_total);
 
         assert!(post_texts[text_post_total - 1].ends_with(&last_text_post_suffix));
         assert_eq!(post_texts[text_post_total], format!("Source: {}", SOURCE_URL));
@@ -303,7 +305,7 @@ mod tests {
         let post_total: usize = post_texts.len();
 
         for (index, post_text) in post_texts.iter().enumerate() {
-            assert!(post_text.ends_with(&format!(" {}/{}", index + 1, post_total)));
+            assert!(post_text.ends_with(&format!("{}{}/{}", NUMBERING_SEPARATOR, index + 1, post_total)));
             assert!(weighted_length(post_text) <= settings.post_limit);
         }
     }
@@ -313,7 +315,7 @@ mod tests {
         let settings: ThreadSettings = create_settings(30, 9, ThreadNumbering::FirstPost);
 
         let post_texts: Vec<String> = split_post_text(&create_numbered_words(20), None, &settings).unwrap();
-        let first_post_suffix: String = format!(" 1/{}", post_texts.len());
+        let first_post_suffix: String = format!("{}1/{}", NUMBERING_SEPARATOR, post_texts.len());
 
         assert!(post_texts[0].ends_with(&first_post_suffix));
         assert!(post_texts[1..].iter().all(|post_text| !post_text.contains('/')));
@@ -325,7 +327,7 @@ mod tests {
 
         let post_texts: Vec<String> = split_post_text("one\n\ntwo three four five six", None, &settings).unwrap();
 
-        assert_eq!(post_texts, vec!["one\n\ntwo three 1/2".to_string(), "four five six 2/2".to_string()]);
+        assert_eq!(post_texts, vec!["one\n\ntwo three\n1/2".to_string(), "four five six\n2/2".to_string()]);
     }
 
     #[test]
@@ -344,7 +346,7 @@ mod tests {
         let post_texts: Vec<String> = split_post_text(&create_numbered_words(40), Some(SOURCE_URL), &settings).unwrap();
 
         assert_eq!(post_texts.len(), 4);
-        assert!(post_texts[2].ends_with(" 3/3"));
+        assert!(post_texts[2].ends_with("\n3/3"));
         assert_eq!(post_texts[3], format!("Full text: {}", SOURCE_URL));
     }
 
