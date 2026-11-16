@@ -26,6 +26,7 @@ use crate::secrets;
 
 const DEFAULT_CHROME_MACOS: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const BROWSER_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+const EDITOR_SETTLE_DELAY: Duration = Duration::from_millis(800);
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
@@ -38,8 +39,10 @@ const SELECTOR_COMPOSE_NAV: &str = "a[data-testid=\"SideNav_NewTweet_Button\"]";
 const SELECTOR_LOGIN_USERNAME: &str = "input[name=\"username_or_email\"]";
 const SELECTOR_LOGIN_PASSWORD: &str = "input[name=\"password\"]";
 const SELECTOR_LOGIN_CHALLENGE: &str = "input[data-testid=\"ocfEnterTextTextInput\"]";
-const SELECTOR_TWEET_BUTTON: &str = "button[data-testid=\"tweetButton\"]";
-const SELECTOR_ADD_POST_BUTTON: &str = "button[data-testid=\"addButton\"]";
+// The compose page also renders the home timeline's inline composer behind the dialog, with the same test ids.
+const SELECTOR_COMPOSE_DIALOG: &str = "[role=\"dialog\"]";
+const SELECTOR_TWEET_BUTTON: &str = "[role=\"dialog\"] button[data-testid=\"tweetButton\"]";
+const SELECTOR_ADD_POST_BUTTON: &str = "[role=\"dialog\"] button[data-testid=\"addButton\"]";
 const SELECTOR_LATEST_POST_TIME: &str = "article time";
 
 pub enum PostFailure {
@@ -207,13 +210,12 @@ impl Session {
     }
 
     pub async fn post(&self, post_texts: &[String]) -> Result<(), PostFailure> {
-        let first_editor: Element = self
-            .open_composer()
+        self.open_composer()
             .await
             .map_err(PostFailure::EnvironmentBeforeCompose)?;
 
         let publish_button: Element = self
-            .compose_thread(first_editor, post_texts)
+            .compose_thread(post_texts)
             .await
             .map_err(PostFailure::RecordBeforePublish)?;
 
@@ -309,25 +311,23 @@ impl Session {
         Ok(())
     }
 
-    async fn open_composer(&self) -> Result<Element, AppError> {
+    async fn open_composer(&self) -> Result<(), AppError> {
         self.page.goto(URL_COMPOSE).await?;
 
-        let first_editor: Element =
+        let _first_editor: Element =
             wait_for_element(&self.page, &post_editor_selector(0), Duration::from_secs(20)).await?;
 
-        Ok(first_editor)
+        Ok(())
     }
 
-    async fn compose_thread(&self, first_editor: Element, post_texts: &[String]) -> Result<Element, AppError> {
-        let mut editor: Element = first_editor;
-
+    async fn compose_thread(&self, post_texts: &[String]) -> Result<Element, AppError> {
         for (post_index, post_text) in post_texts.iter().enumerate() {
             if post_index > 0 {
-                editor = self.add_thread_post(post_index).await?;
+                self.add_thread_post(post_index).await?;
             }
 
-            self.fill_editor(&editor, post_text).await?;
-            confirm_editor_holds(&editor, post_index, post_text).await?;
+            self.fill_editor(post_index, post_text).await?;
+            self.confirm_editor_holds(post_index, post_text).await?;
         }
 
         let publish_button_enabled: bool = self
@@ -342,29 +342,54 @@ impl Session {
         Ok(publish_button)
     }
 
-    async fn add_thread_post(&self, post_index: usize) -> Result<Element, AppError> {
+    async fn add_thread_post(&self, post_index: usize) -> Result<(), AppError> {
         let add_post_button: Element =
             wait_for_element(&self.page, SELECTOR_ADD_POST_BUTTON, Duration::from_secs(10)).await?;
         add_post_button.click().await?;
 
-        let editor: Element =
+        let _new_editor: Element =
             wait_for_element(&self.page, &post_editor_selector(post_index), Duration::from_secs(20)).await?;
 
-        Ok(editor)
+        // X re-renders a new editor right after creating it.
+        tokio::time::sleep(EDITOR_SETTLE_DELAY).await;
+
+        Ok(())
     }
 
     // Element::type_str fails on any character missing from a US keyboard layout, including "\n".
-    async fn fill_editor(&self, editor: &Element, post_text: &str) -> Result<(), AppError> {
-        editor.click().await?;
+    async fn fill_editor(&self, post_index: usize, post_text: &str) -> Result<(), AppError> {
+        let focused: bool = self.eval_bool(focus_post_editor_script(post_index)?).await?;
+        if !focused {
+            return Err(AppError::new(&format!("thread post {} has no editor to focus", post_index + 1)));
+        }
 
         for (line_index, line) in post_text.split('\n').enumerate() {
             if line_index > 0 {
+                let editor: Element =
+                    wait_for_element(&self.page, &post_editor_selector(post_index), Duration::from_secs(5)).await?;
                 editor.press_key("Enter").await?;
             }
 
             if !line.is_empty() {
                 self.page.execute(InsertTextParams::new(line)).await?;
             }
+        }
+
+        Ok(())
+    }
+
+    async fn confirm_editor_holds(&self, post_index: usize, post_text: &str) -> Result<(), AppError> {
+        let editor_text: String = self.eval_string(post_editor_text_script(post_index)?).await?;
+
+        let editor_words: Vec<&str> = editor_text.split_whitespace().collect();
+        let expected_words: Vec<&str> = post_text.split_whitespace().collect();
+
+        if editor_words != expected_words {
+            return Err(AppError::new(&format!(
+                "thread post {} does not hold the intended text after typing; editor shows: {}",
+                post_index + 1,
+                editor_text,
+            )));
         }
 
         Ok(())
@@ -446,6 +471,18 @@ impl Session {
         }
     }
 
+    async fn eval_string(&self, script: String) -> Result<String, AppError> {
+        let params: EvaluateParams = EvaluateParams::builder()
+            .expression(script)
+            .return_by_value(true)
+            .build()
+            .map_err(|message| AppError::new(&message))?;
+
+        let value: String = self.page.evaluate(params).await?.into_value().unwrap_or_default();
+
+        Ok(value)
+    }
+
     async fn eval_bool(&self, script: String) -> Result<bool, AppError> {
         let params: EvaluateParams = EvaluateParams::builder()
             .expression(script)
@@ -477,7 +514,27 @@ async fn wait_for_element(page: &Page, selector: &str, timeout: Duration) -> Res
 }
 
 fn post_editor_selector(post_index: usize) -> String {
-    format!("div[data-testid=\"tweetTextarea_{}\"]", post_index)
+    format!("{} div[data-testid=\"tweetTextarea_{}\"]", SELECTOR_COMPOSE_DIALOG, post_index)
+}
+
+// Focus through the DOM, not a mouse click: a click can land on the dialog backdrop and close it.
+fn focus_post_editor_script(post_index: usize) -> Result<String, AppError> {
+    let script: String = format!(
+        "(() => {{ const editor = document.querySelector({selector}); if (!editor) return false; \
+         if (!editor.contains(document.activeElement)) editor.focus(); return true; }})()",
+        selector = serde_json::to_string(&post_editor_selector(post_index))?,
+    );
+
+    Ok(script)
+}
+
+fn post_editor_text_script(post_index: usize) -> Result<String, AppError> {
+    let script: String = format!(
+        "(() => {{ const editor = document.querySelector({selector}); return editor ? editor.innerText : ''; }})()",
+        selector = serde_json::to_string(&post_editor_selector(post_index))?,
+    );
+
+    Ok(script)
 }
 
 fn publish_button_enabled_script() -> Result<String, AppError> {
@@ -488,23 +545,6 @@ fn publish_button_enabled_script() -> Result<String, AppError> {
     );
 
     Ok(script)
-}
-
-async fn confirm_editor_holds(editor: &Element, post_index: usize, post_text: &str) -> Result<(), AppError> {
-    let editor_text: String = editor.inner_text().await?.unwrap_or_default();
-
-    let editor_words: Vec<&str> = editor_text.split_whitespace().collect();
-    let expected_words: Vec<&str> = post_text.split_whitespace().collect();
-
-    if editor_words != expected_words {
-        return Err(AppError::new(&format!(
-            "thread post {} does not hold the intended text after typing; editor shows: {}",
-            post_index + 1,
-            editor_text,
-        )));
-    }
-
-    Ok(())
 }
 
 fn generate_totp_code(seed_base32: &str) -> Result<String, AppError> {
